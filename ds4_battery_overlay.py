@@ -177,11 +177,23 @@ def is_bt_device(dev):
 
 
 def activate_bt_full_report(dev):
-    """向蓝牙 DS4 发送 0x11 输出配置报告，把设备从位置报告切换为完整报告。
+    """激活蓝牙 DS4 完整报告模式。
 
-    实测：部分蓝牙 DS4 未激活时只发 0x01 位置报告（无电量、无按键），
-    发送 0x11 输出报告后才切换到 0x11 完整报告（电量位于 byte40）。
+    蓝牙 DS4 默认只发 0x01 位置报告（仅摇杆数据，无按键、无电量）。
+    读取 FEATURE report 0x02（校准数据）后，设备才会切换到 0x11 完整报告
+    （电量位于 byte40）——这是实测有效的机制，Linux hid-sony 驱动同样如此。
+    发送 0x11 输出报告无法触发切换（实测无效），仅作兜底保留。
     """
+    try:
+        feats = dev.find_feature_reports()
+        for r in feats:
+            if getattr(r, "report_id", None) != 0x02:
+                continue
+            r.get()          # GET REPORT FEATURE 0x02 → 触发切换到 0x11
+            return True
+    except Exception:
+        pass
+    # 兜底：发送 0x11 输出配置报告（部分固件可用）
     try:
         reps = dev.find_output_reports()
         for r in reps:
@@ -268,7 +280,7 @@ def read_battery_from_device(dev):
     （78 字节，头部多 2 字节 0xc0 0x00）。
     电量状态字节位于第 30（USB）/ 40（蓝牙完整报告）字节：
         bit3-0 = 电量档位（0-10）；bit4 = 充电中；bit5 = 已充满。
-    蓝牙设备打开后先发送 0x11 配置报告激活完整报告模式（实测必需）。
+    蓝牙设备打开后先读取 FEATURE 0x02（校准数据）激活完整报告模式（实测必需）。
     """
     result = {}
     got = threading.Event()
