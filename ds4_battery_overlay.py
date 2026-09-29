@@ -128,12 +128,18 @@ def round_rect(canvas, x1, y1, x2, y2, r, **kw):
 
 
 def find_ds4_devices():
-    """枚举当前接入的 DS4 设备列表。"""
+    """枚举当前接入的 DS4 设备列表。
+
+    蓝牙接口优先返回：初版 DS4（PID 09CC）充电时，USB 接口的电量字节
+    会跳到 11 档（充电电压满刻度假象，易误判为 100%），而蓝牙接口的
+    byte32 报真实电量（无线/插电均准确）。纯 USB 连接时仍只有 USB 接口。
+    """
     try:
         devices = hid.HidDeviceFilter(vendor_id=DS4_VID).get_devices()
     except Exception:
         return []
-    return [d for d in devices if d.product_id in DS4_PIDS]
+    ds = [d for d in devices if d.product_id in DS4_PIDS]
+    return sorted(ds, key=lambda d: not is_bt_device(d))
 
 
 def read_ds4_battery():
