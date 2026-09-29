@@ -95,6 +95,44 @@ LOG_PATH = os.path.join(BASE_DIR, "ds4_battery_overlay.log")
 LOG_MAX_BYTES = 200 * 1024   # 日志体积上限 200 KB，超限自动裁剪
 LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 
+# 最近一次无线（cable=0）真实电量记忆：初版 DS4 有线充电时 USB 报告
+# 的电量字节会跳到 11 档（充电电压满刻度），无法读出真实电量，
+# 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
+STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
+_last_wireless_pct = None
+
+
+def _load_state():
+    """读取持久化的无线电量记忆。"""
+    global _last_wireless_pct
+    try:
+        import json
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            v = json.load(f).get("wireless_pct")
+        if v is not None and 0 <= v <= 100:
+            _last_wireless_pct = v
+    except Exception:
+        _last_wireless_pct = None
+
+
+def _save_state():
+    """保存无线电量记忆到状态文件。"""
+    try:
+        import json
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump({"wireless_pct": _last_wireless_pct}, f)
+    except Exception:
+        pass
+
+
+def _remember_wireless(pct):
+    """记录真实电量（无线读数，或有线档位 0-10 的充电进度）。"""
+    global _last_wireless_pct
+    if pct is None or not (0 <= pct <= 100):
+        return
+    _last_wireless_pct = pct
+    _save_state()
+
 
 def _trim_log(path):
     """日志超过上限时只保留最近 LOG_KEEP_LINES 行，控制体积。"""
@@ -155,15 +193,20 @@ def decode_status(status, is_bt=False):
     """
     解析电量状态字节，返回 {"pct","cable","charging","full"}。
 
-    USB(0x01) 报告 byte30：bit3-0 = 电量档位(0-10)，bit4 = 充电中，bit5 = 已充满。
-    蓝牙(0x11) 报告 byte32（= USB byte30 + 2 字节蓝牙头，与 Linux hid-sony
-    驱动一致）：bit3-0 = 电量档位，bit4 = USB 线缆状态（充电中）。按驱动逻辑：
-      · 插电：档位 0-10，档×10 为电量；档位 ≥ 10 即充满（>10 视为充满）
-      · 电池（未插电）：档位 0-9，电量为 (档位+1)×10（档 9 = 100% 满电）
+    USB(0x01) 报告 byte30：
+      · 有线充电中（bit4=1）：档位 0-10 → 档×10 为真实充电进度；
+        档位 11-15 为初版 DS4（PID 09CC）充电电压满刻度假象（真实电量
+        不可读），此时用最近一次无线记忆电量显示"充电中"。
+      · 充满（bit4=0 且档位 ≥ 11）：100% 已充满。
+      · 无线（bit4=0 且档位 0-9）：(档位+1)×10。
+    蓝牙(0x11) 报告 byte32（= USB byte30 + 2 字节蓝牙头，与 Linux
+    hid-sony 驱动一致）：bit3-0 = 电量档位，bit4 = USB 线缆状态。
+      · 插电：档位 0-10，档×10；档位 ≥ 10 即充满
+      · 无线：档位 0-9，电量为 (档位+1)×10（档 9 = 100%）
     """
+    level = status & 0x0F
+    cable = bool(status & 0x10)
     if is_bt:
-        level = status & 0x0F
-        cable = bool(status & 0x10)
         if cable:
             charging = level <= 10
             pct = 100 if level >= 10 else level * 10
@@ -174,12 +217,20 @@ def decode_status(status, is_bt=False):
         full = cable and pct >= 100
         return {"pct": pct, "cable": cable,
                 "charging": charging, "full": full}
-    level = status & 0x0F
-    charging = bool(status & 0x10)
-    full = bool(status & 0x20)
-    pct = 100 if full else level * 10
-    return {"pct": max(0, min(100, pct)),
-            "cable": bool(status & 0x10),
+    if cable:
+        if level <= 10:
+            pct, charging, full = level * 10, True, False
+        else:
+            # 初版 DS4 有线充电：电压满刻度假象 → 用最近无线记忆电量
+            pct = _last_wireless_pct if _last_wireless_pct is not None else 100
+            charging, full = True, False
+    else:
+        if level >= 11:
+            pct, charging, full = 100, False, True     # 充满
+        else:
+            pct = (level + 1) * 10
+            charging, full = False, False
+    return {"pct": max(0, min(100, pct)), "cable": cable,
             "charging": charging, "full": full}
 
 
@@ -369,11 +420,16 @@ def read_status_from_device(dev):
                 return
             if data[0] == 0x11:
                 maybe_dump_bt_report(data)
-                result["info"] = decode_bt_report(data, bi)
+                info = decode_bt_report(data, bi)
             elif is_bt_device(dev):
                 return  # 蓝牙设备激活前的位置报告(0x01)无电量，忽略
             else:
-                result["info"] = decode_status(data[bi])
+                info = decode_status(data[bi])
+            # 记忆真实电量：无线读数（bit4=0），或有线档位 ≤10 的充电进度
+            raw = data[bi]
+            if not (raw & 0x10) or (raw & 0x0F) <= 10:
+                _remember_wireless(info["pct"])
+            result["info"] = info
             got.set()
         except Exception:
             pass
@@ -739,6 +795,10 @@ class BatteryOverlay:
                                 info = decode_bt_report(data, bi)
                             else:
                                 info = decode_status(data[bi])
+                            # PS 双击同帧：记忆真实电量（无线，或有线档位 ≤10）
+                            raw = data[bi]
+                            if not (raw & 0x10) or (raw & 0x0F) <= 10:
+                                _remember_wireless(info["pct"])
                             self.result_q.put({"kind": "battery",
                                                "reason": "ps", **info})
                         else:
@@ -968,6 +1028,9 @@ def main():
     if not _acquire_single_instance():
         log("检测到已有实例在运行，本次启动退出")
         sys.exit(0)
+
+    # 读取持久化的无线电量记忆（有线充电假象时用于显示真实电量）
+    _load_state()
 
     # DPI 感知，保证文字清晰
     try:
