@@ -55,7 +55,7 @@ BT_HEADER_EXTRA = 2                    # 蓝牙(0x11)报告头部比 USB(0x01) �
 BT_ACTIVATE_LENS = (79, 547)           # 0x11 输出报告候选长度（部分设备要求 547）
 BT_ACTIVATE_LED = 0xFF                 # 激活配置的 LED R（红色）
 
-HOLD_SECONDS = 5.0                     # 电量显示保持时间（秒）
+HOLD_SECONDS = 3.0                     # 电量显示保持时间（秒）
 HOLD_LOW_SECONDS = 8.0                 # 低电量提示保持时间（秒）
 HOLD_DISCONNECT_SECONDS = 2.5          # 拔出提示保持时间（秒）
 LOW_BATTERY_PCT = 20                   # 低电量阈值（%）
