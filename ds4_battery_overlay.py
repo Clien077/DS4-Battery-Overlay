@@ -43,25 +43,27 @@ except ImportError:
 DS4_VID = 0x054C                       # Sony Interactive Entertainment
 DS4_PIDS = (0x09CC, 0x0BA0, 0x05C4)    # DS4 常见 PID：初版 / 2016 新版 / 早期型号
 BATTERY_INDEX = 30                     # 电量状态字节（USB 0x01 报告，含 Report ID）
-BT_BATTERY_INDEX = 40                  # 电量状态字节（蓝牙 0x11 完整报告）
+BT_BATTERY_INDEX = 32                  # 电量状态字节（蓝牙 0x11 完整报告，= USB byte30 + 蓝牙头 2 字节）
 PS_BUTTON_INDEX = 7                    # PS 按键所在字节（USB 0x01 报告）
 PS_BUTTON_MASK = 0x01                  # PS 按键掩码（bit0）
 DPAD_INDEX = 5                         # 十字键所在字节（USB 0x01 报告）
 POV_DOWN = 4                           # 十字键"下"的 POV 值（8=未按，0=上，4=下）
 DOUBLE_PRESS_MS = 500                  # PS 双击判定窗口（毫秒）
 BT_HEADER_EXTRA = 2                    # 蓝牙(0x11)报告头部比 USB(0x01) 多 2 字节（0xc0 0x00），按键等偏移 +2
-# 蓝牙 DS4 激活：未发送 0x11 输出配置报告前，部分蓝牙 DS4 只发 0x01 位置报告
-# （无按键、无电量），发送后才切换到 0x11 完整报告（实测必需）。
-BT_ACTIVATE_LENS = (79, 547)           # 0x11 输出报告候选长度（部分设备要求 547）
-BT_ACTIVATE_LED = 0xFF                 # 激活配置的 LED R（红色）
+# 蓝牙 DS4 激活：设备默认只发 0x01 位置报告（仅摇杆，无按键无电量）。
+# 读取 FEATURE report 0x02（校准数据）后，设备才切换到 0x11 完整报告
+# （电量在 byte32，与 Linux hid-sony 驱动一致）。发送 0x11 输出报告无法触发切换（实测无效）。
+BT_ACTIVATE_LENS = (79, 547)           # 兜底：0x11 输出报告候选长度（实测主方案不依赖此）
+BT_ACTIVATE_LED = 0xFF                 # 兜底激活配置的 LED R（红色）
 
 HOLD_SECONDS = 3.0                     # 电量显示保持时间（秒）
-HOLD_LOW_SECONDS = 8.0                 # 低电量提示保持时间（秒）
+HOLD_PS_SECONDS = 2.0                  # PS 双击弹电量窗保持时间（秒）
+HOLD_LOW_SECONDS = 3.0                 # 低电量提示保持时间（秒）
 HOLD_DISCONNECT_SECONDS = 2.5          # 拔出提示保持时间（秒）
 LOW_BATTERY_PCT = 20                   # 低电量阈值（%）
 LOW_CHECK_INTERVAL_POLLS = 30          # 低电量周期检查（每 30 次轮询 ≈ 30 秒）
-FADE_IN_MS = 200                       # 淡入总时长（毫秒）
-FADE_OUT_MS = 500                      # 淡出总时长（毫秒）
+FADE_IN_MS = 150                       # 淡入总时长（毫秒；与淡出合计 0.5 秒）
+FADE_OUT_MS = 350                      # 淡出总时长（毫秒；与淡入合计 0.5 秒）
 POLL_MS = 1000                         # 手柄接入检测轮询间隔（毫秒）
 READ_TIMEOUT = 2.0                     # 读取电量超时（秒）
 
@@ -148,20 +150,30 @@ def decode_status(status, is_bt=False):
     解析电量状态字节，返回 {"pct","cable","charging","full"}。
 
     USB(0x01) 报告 byte30：bit3-0 = 电量档位(0-10)，bit4 = 充电中，bit5 = 已充满。
-    蓝牙(0x11) 报告 byte40：bit3-0 = 电量档位(0-10)；充电/充满标志按实测设备
-    用 bit4/bit5，同时兼容 Linux hid-sony 的 bit6/bit7（任一命中即生效）。
-    档位均按 0-10 档 ×10 换算。
+    蓝牙(0x11) 报告 byte32（= USB byte30 + 2 字节蓝牙头，与 Linux hid-sony
+    驱动一致）：bit3-0 = 电量档位，bit4 = USB 线缆状态（充电中）。按驱动逻辑：
+      · 插电：档位 0-10，档×10 为电量；档位 ≥ 10 即充满（>10 视为充满）
+      · 电池（未插电）：档位 0-9，电量为 (档位+1)×10（档 9 = 100% 满电）
     """
-    level = status & 0x0F
     if is_bt:
-        charging = bool(status & 0x10) or bool(status & 0x40)
-        full = bool(status & 0x20) or bool(status & 0x80)
-    else:
-        charging = bool(status & 0x10)
-        full = bool(status & 0x20)
+        level = status & 0x0F
+        cable = bool(status & 0x10)
+        if cable:
+            charging = level <= 10
+            pct = 100 if level >= 10 else level * 10
+        else:
+            charging = False
+            pct = (level + 1) * 10
+        pct = min(100, pct)
+        full = cable and pct >= 100
+        return {"pct": pct, "cable": cable,
+                "charging": charging, "full": full}
+    level = status & 0x0F
+    charging = bool(status & 0x10)
+    full = bool(status & 0x20)
     pct = 100 if full else level * 10
     return {"pct": max(0, min(100, pct)),
-            "cable": not is_bt and bool(status & 0x10),
+            "cable": bool(status & 0x10),
             "charging": charging, "full": full}
 
 
@@ -181,7 +193,7 @@ def activate_bt_full_report(dev):
 
     蓝牙 DS4 默认只发 0x01 位置报告（仅摇杆数据，无按键、无电量）。
     读取 FEATURE report 0x02（校准数据）后，设备才会切换到 0x11 完整报告
-    （电量位于 byte40）——这是实测有效的机制，Linux hid-sony 驱动同样如此。
+    （电量位于 byte32）——这是实测有效的机制，Linux hid-sony 驱动同样如此。
     发送 0x11 输出报告无法触发切换（实测无效），仅作兜底保留。
     """
     try:
@@ -230,13 +242,13 @@ def maybe_dump_bt_report(data):
         return
     _bt_dump_last = now
     hexs = " ".join("%02X" % b for b in data[:42])
-    b40 = data[40] if len(data) > 40 else None
-    log(f"蓝牙报告诊断: 长度={len(data)} byte40={b40:#04x} 前42字节: {hexs}")
+    b32 = data[32] if len(data) > 32 else None
+    log(f"蓝牙报告诊断: 长度={len(data)} byte32={b32:#04x} 前42字节: {hexs}")
 
 
 def decode_bt_report(data, bi=BT_BATTERY_INDEX):
     """
-    蓝牙(0x11)完整报告电量字节解析（电量位于 byte40）。
+    蓝牙(0x11)完整报告电量字节解析（电量位于 byte32）。
     返回与 decode_status 相同的结构。
     """
     raw = data[bi] if len(data) > bi else 0
@@ -246,7 +258,7 @@ def decode_bt_report(data, bi=BT_BATTERY_INDEX):
 def report_offsets(data):
     """
     返回 (电量字节偏移, PS 按键字节偏移)。
-    USB(0x01) 报告：电量@30、PS@7；蓝牙(0x11) 完整报告：电量@40、PS@9。
+    USB(0x01) 报告：电量@30、PS@7；蓝牙(0x11) 完整报告：电量@32、PS@9。
     非 DS4 主输入报告返回 None。
     """
     if not data or data[0] not in (0x01, 0x11):
@@ -278,8 +290,9 @@ def read_battery_from_device(dev):
     读取 DS4 电量。
     报告格式：USB 连接时输入报告 ID 为 0x01（64 字节），蓝牙为 0x11
     （78 字节，头部多 2 字节 0xc0 0x00）。
-    电量状态字节位于第 30（USB）/ 40（蓝牙完整报告）字节：
-        bit3-0 = 电量档位（0-10）；bit4 = 充电中；bit5 = 已充满。
+    电量状态字节位于第 30（USB）/ 32（蓝牙完整报告）字节：
+        USB: bit3-0 = 电量档位（0-10）；bit4 = 充电中；bit5 = 已充满。
+        蓝牙: bit3-0 = 电量档位（电池 0-9 / 插电 0-10）；bit4 = 线缆状态（充电中）。
     蓝牙设备打开后先读取 FEATURE 0x02（校准数据）激活完整报告模式（实测必需）。
     """
     result = {}
@@ -609,13 +622,15 @@ class BatteryOverlay:
             fade_in()
         self.timer_job = self.root.after(int(hold_seconds * 1000), self.fade_out)
 
-    def show_battery(self, percent, charging=False, full=False):
-        """弹出电量窗；低电量时红色高亮并停留更久。"""
+    def show_battery(self, percent, charging=False, full=False, hold=None):
+        """弹出电量窗；低电量时红色高亮并停留更久；hold 可指定保持秒数。"""
         self.draw_battery(percent, charging, full)
         low = percent is not None and percent <= LOW_BATTERY_PCT
+        if hold is None:
+            hold = HOLD_LOW_SECONDS if low else HOLD_SECONDS
         log(f"弹出电量窗 pct={percent} charging={charging} full={full} "
-            f"hold={'低电量8s' if low else '5s'}")
-        self._present(HOLD_LOW_SECONDS if low else HOLD_SECONDS)
+            f"hold={hold}s")
+        self._present(hold)
 
     def show_disconnect(self):
         """弹出断开提示。"""
@@ -875,8 +890,10 @@ class BatteryOverlay:
         else:
             if pct is not None and pct <= LOW_BATTERY_PCT:
                 self.low_warned = True
+            # PS 双击手动查看：固定显示 2 秒（淡入+淡出合计 0.5 秒）
+            hold = HOLD_PS_SECONDS if reason == "ps" else None
             self.show_battery(pct, payload.get("charging", False),
-                              payload.get("full", False))
+                              payload.get("full", False), hold=hold)
         # 顺带刷新横条（接入/PS 读取的同一帧数据）
         self.update_bar(pct, payload.get("charging", False),
                         payload.get("full", False))
