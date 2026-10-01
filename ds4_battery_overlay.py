@@ -23,7 +23,9 @@ DS4 电量提示悬浮窗
 退出：右键点击弹出的电量窗即可退出程序；或在任务管理器中结束 pythonw/python 进程。
 """
 
+import collections
 import ctypes
+import faulthandler
 import os
 import queue
 import sys
@@ -76,6 +78,9 @@ READ_TIMEOUT = 2.0                     # 读取电量超时（秒）
 # 因此：所有 HID 枚举都放到后台线程；用 is_plugged() 主动探测句柄健康；
 # 连续失败时指数退避，避免与共享软件互相抢设备形成风暴。
 DEV_POLL_SEC = 1.0                     # 后台手柄连接检测周期（秒）
+DEV_POLL_IDLE_SEC = 5.0                # 未连接时的降频探测间隔（秒，省 CPU）
+RES_SAMPLE_SEC = 300.0                 # 资源占用采样/写日志间隔（秒）
+MEM_LIMIT_MB = 250.0                   # 内存超过此值视为异常增长 → 自愈重启（MB）
 WATCH_PROBE_SEC = 5.0                  # 常驻句柄健康探测周期（秒）
 WATCH_QUIET_SEC = 45.0                 # 有报告时的静默上限；超时强制重开（秒）
 WATCH_OPEN_TIMEOUT_SEC = 8.0           # 单次打开句柄的时限；超时视为卡住并放弃该次（秒）
@@ -121,6 +126,7 @@ else:
 
 LOG_PATH = os.path.join(BASE_DIR, "ds4_battery_overlay.log")
 LOG_MAX_BYTES = 200 * 1024   # 日志体积上限 200 KB，超限自动裁剪
+CRASH_PATH = os.path.join(BASE_DIR, "ds4_battery_overlay_crash.log")
 LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 
 # 最近一次无线（cable=0）真实电量记忆：初版 DS4 有线充电时 USB 报告
@@ -176,26 +182,128 @@ def _remember_wireless(pct):
 
 
 def _trim_log(path):
-    """日志超过上限时只保留最近 LOG_KEEP_LINES 行，控制体积。"""
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-    with open(path, "w", encoding="utf-8") as f:
-        f.writelines(lines[-LOG_KEEP_LINES:])
+    """日志超限时只保留最近几行。
+
+    只读一次、一次性重写，并且只在真正超限时才触发（见 log()）。
+    旧实现每次写日志都要先读整个文件再统计大小，属于 O(文件大小) 的额外
+    I/O，长跑时是持续开销。
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        with open(path, "w", encoding="utf-8", errors="replace") as f:
+            f.writelines(lines[-LOG_KEEP_LINES:])
+    except Exception:
+        pass
+
+
+_pmc_cls = None
+
+
+def _read_proc_stats():
+    """读取自身进程的 (内存MB, 句柄数)。
+
+    坑：ctypes 调用这两个 API **必须声明 argtypes**——否则 64 位进程句柄会被
+    按 32 位 int 传递（甚至截断），调用会静默返回 0、读不到任何数据。
+    取不到时返回 (None, None)，绝不影响主流程。
+    """
+    global _pmc_cls
+    try:
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong),
+                        ("PageFaultCount", ctypes.c_ulong),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p,
+                                               ctypes.POINTER(_PMC),
+                                               ctypes.c_ulong]
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        k32.GetProcessHandleCount.argtypes = [ctypes.c_void_p,
+                                              ctypes.POINTER(ctypes.c_ulong)]
+        k32.GetProcessHandleCount.restype = ctypes.c_int
+        hproc = ctypes.c_void_p(k32.GetCurrentProcess())
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(pmc)
+        mem_mb = None
+        if psapi.GetProcessMemoryInfo(hproc, ctypes.byref(pmc), pmc.cb):
+            mem_mb = pmc.WorkingSetSize / 1048576.0
+        cnt = ctypes.c_ulong(0)
+        handles = int(cnt.value) if k32.GetProcessHandleCount(
+            hproc, ctypes.byref(cnt)) else None
+        return mem_mb, handles
+    except Exception:
+        return None, None
+
+
+_log_lock = threading.Lock()
+_log_size = None
+
+
+def _maybe_register_faulthandler():
+    """注册原生崩溃转储：C 层崩溃（如 HID/dll 段错误）会留下 Python 堆栈，
+    这是"防止使用时崩溃"最重要的证据来源——否则进程直接消失、什么都没有。
+    """
+    if getattr(_maybe_register_faulthandler, "_done", False):
+        return
+    _maybe_register_faulthandler._done = True
+    try:
+        f = open(CRASH_PATH, "a", encoding="utf-8", errors="replace")
+        faulthandler.enable(file=f, all_threads=True)
+    except Exception:
+        pass
 
 
 def log(msg):
-    """写运行日志到脚本同目录，便于无控制台(pythonw)时排查问题。
+    """写运行日志到程序同目录，便于无控制台(pythonw)时排查问题。
 
-    日志体积有上限（LOG_MAX_BYTES），超限自动裁剪，不会无限增长。
+    性能要点（旧实现每次调用都要 stat + 打开文件，超限时还要读整个文件）：
+      · 文件大小用内存计数器维护，避免每次都 stat；
+      · 只在计数器显示超限时才做裁剪；
+      · 单次 append 写入后立即关闭——不长期占用文件句柄，
+        这样程序运行时用户/工具依然能直接读取日志。
     """
+    global _log_size
     try:
-        if os.path.exists(LOG_PATH) and \
-                os.path.getsize(LOG_PATH) > LOG_MAX_BYTES:
-            _trim_log(LOG_PATH)
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+        with _log_lock:
+            if _log_size is None:
+                try:
+                    _log_size = os.path.getsize(LOG_PATH)
+                except OSError:
+                    _log_size = 0
+            if _log_size > LOG_MAX_BYTES:
+                _trim_log(LOG_PATH)
+                try:
+                    _log_size = os.path.getsize(LOG_PATH)
+                except OSError:
+                    _log_size = 0
+            line = "[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line)
+            _log_size += len(line.encode("utf-8", "replace"))
     except Exception:
         pass
+
+
+_bar_font_cache = {}
+
+
+def _bar_font(size, weight="bold"):
+    """缓存字体对象：tkfont.Font 每次构造都有开销，横条刷新频繁需复用。"""
+    key = (int(size), weight)
+    f = _bar_font_cache.get(key)
+    if f is None:
+        f = tkfont.Font(font=("Segoe UI", int(size), weight))
+        _bar_font_cache[key] = f
+    return f
 
 
 def _lighten(hex_color, amount=0.55):
@@ -339,19 +447,28 @@ def activate_bt_full_report(dev):
     return False
 
 
-# 蓝牙报告诊断：首帧 hex 转储限频（秒），便于核对真实字节布局
+# 蓝牙报告诊断：默认每个进程只转储一次。
+# 旧实现每 30 秒就打印一整行 42 字节 hex，蓝牙连接下会持续刷日志
+# （实测日志里近 1/3 都是这类诊断行），纯属浪费 CPU 与磁盘。
+# 排查解析问题时可用环境变量 DS4_BT_DUMP=1 恢复 30 秒限频输出。
 _bt_dump_last = 0.0
+_bt_dump_done = False
 
 
 def maybe_dump_bt_report(data):
-    """蓝牙(0x11)报告首次出现时把关键字节写入日志，供排查电量解析问题。"""
-    global _bt_dump_last
+    """蓝牙(0x11)报告关键字节写入日志，供排查电量解析问题。"""
+    global _bt_dump_last, _bt_dump_done
     if not data or data[0] != 0x11:
         return
-    now = time.time()
-    if now - _bt_dump_last < 30:
-        return
-    _bt_dump_last = now
+    if os.environ.get("DS4_BT_DUMP") == "1":
+        now = time.time()
+        if now - _bt_dump_last < 30:
+            return
+        _bt_dump_last = now
+    else:
+        if _bt_dump_done:
+            return
+        _bt_dump_done = True
     hexs = " ".join("%02X" % b for b in data[:42])
     b32 = data[32] if len(data) > 32 else None
     log(f"蓝牙报告诊断: 长度={len(data)} byte32={b32:#04x} 前42字节: {hexs}")
@@ -574,23 +691,13 @@ class BatteryOverlay:
         # 右键点击弹窗 = 退出程序
         self.canvas.bind("<Button-3>", lambda e: self.root.destroy())
 
-        # 顶部电量横条窗口（组合键：十字键下 + PS 切换显示）
-        self.bar_win = tk.Toplevel(self.root)
-        self.bar_win.withdraw()
-        self.bar_win.overrideredirect(True)
-        self.bar_win.attributes("-topmost", True)
-        try:
-            self.bar_win.attributes("-transparentcolor", MAGIC)
-        except tk.TclError:
-            pass
-        bx = (sw - BAR_W) // 2
-        by = BAR_TOP_MARGIN
-        self.bar_win.geometry(f"{BAR_W}x{BAR_H}+{bx}+{by}")
-        self.bar_canvas = tk.Canvas(self.bar_win, width=BAR_W, height=BAR_H,
-                                    bg=MAGIC, highlightthickness=0)
-        self.bar_canvas.pack()
-        # 右键点击横条 = 关闭横条
-        self.bar_canvas.bind("<Button-3>", lambda e: self._toggle_bar_event())
+        # 顶部电量横条窗口：**惰性创建**——不用组合键就完全不建，
+        # 省下一个常驻 Toplevel + Canvas 的内存与 Tk 开销。
+        # （组合键唤出是"先上屏后刷新"，首次创建的少量开销被即时绘制掩盖）
+        self.bar_win = None
+        self.bar_canvas = None
+        self._bar_ready = False
+        self._sw, self._sh = sw, sh
 
         self.state = "hidden"      # hidden / shown / fading
         self.alpha = 0.0
@@ -623,14 +730,23 @@ class BatteryOverlay:
         self._probe_ok_ts = 0.0       # 最近一次 is_plugged() 探测成功的时间
         self._probe_fail_streak = 0   # is_plugged() 连续失败次数
         self._reopen_log_ts = 0.0     # 句柄重开日志限频（避免刷屏）
-        self._active_workers = 0      # 同时运行的 HID 读取线程数
+        self._active_workers = 0      # 兼容保留（并发读取已由常驻工作线程串行化）
         self._worker_lock = threading.Lock()
+        self._worker_todo = collections.deque()   # 待处理的读取任务
+        self._worker_pending = set()              # 已在队列中的任务类型（去重）
+        self._worker_wake = threading.Event()     # 唤醒常驻工作线程
         self._last_queued = {}        # 事件类型 -> 上次入队时间（防触发风暴）
         self.bar_last_data = None     # 横条最近一次真实数据（切换时立即上屏用）
+        self._res_sample_ts = time.time()   # 资源自监控采样时间戳
+        self._last_dev_poll = 0.0           # 上次设备枚举时间（未连接时降频用）
+        self._bar_items = {}                # 横条画布元素 id 缓存（原地更新用）
+        self._bar_geo = None                # 上述缓存对应的画布几何
 
-        # 看门狗线程：后台维护设备连接状态，并在主循环假死（屏幕共享/直播
-        # 场景可能阻塞主线程）时自动重启；启动即做首次枚举，尽快拿到真实状态
+        # 看门狗线程：后台维护设备连接状态、采样资源占用，并在主循环假死
+        # （屏幕共享/直播场景可能阻塞主线程）时自动重启；启动即做首次枚举
         threading.Thread(target=self._watchdog, daemon=True).start()
+        # 常驻读取线程：所有 HID 读取都排在它上面串行执行，线程数恒定
+        threading.Thread(target=self._worker_thread, daemon=True).start()
 
         self.root.after(300, self.poll_loop)
 
@@ -693,6 +809,30 @@ class BatteryOverlay:
                       font=("Segoe UI", 9), fill=TEXT_SUB)
 
     # ---------- 顶部电量横条 ----------
+    def _ensure_bar_win(self):
+        """首次需要时创建横条窗口（惰性创建，不用就不占用资源）。"""
+        if self._bar_ready:
+            return
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-transparentcolor", MAGIC)
+        except tk.TclError:
+            pass
+        win.geometry("%dx%d+%d+%d" % (BAR_W, BAR_H,
+                                      (self._sw - BAR_W) // 2, BAR_TOP_MARGIN))
+        canvas = tk.Canvas(win, width=BAR_W, height=BAR_H, bg=MAGIC,
+                           highlightthickness=0)
+        canvas.pack()
+        # 右键点击横条 = 关闭横条
+        canvas.bind("<Button-3>", lambda e: self._toggle_bar_event())
+        self.bar_win = win
+        self.bar_canvas = canvas
+        self._bar_items = {}
+        self._bar_geo = None
+        self._bar_ready = True
+
     def draw_bar(self, percent, charging=False, full=False, connected=True):
         """绘制顶部电量横条。
 
@@ -702,8 +842,9 @@ class BatteryOverlay:
           · 中部 8px 浅灰轨道 + 同色系浅色进度填充（随电量变色）
           · 百分比数字加大加粗，绘制时带浅色描边（halo），叠在任何壁纸上都清晰
         """
+        # 惰性创建（首次调用时才建窗口；测试替身可能没有该方法）
+        getattr(self, "_ensure_bar_win", lambda: None)()
         c = self.bar_canvas
-        c.delete("all")
 
         # DPI 自适应：用画布**实际像素尺寸**等比换算所有坐标。
         # 关键坑：SetProcessDpiAwareness 之后，Tk 给画布分配的物理像素数会小于
@@ -719,6 +860,13 @@ class BatteryOverlay:
         except Exception:
             cw, ch = BAR_W, BAR_H
         sx, sy = cw / float(BAR_W), ch / float(BAR_H)
+
+        # 画布尺寸/缩放变化（例如切换分辨率）时丢弃缓存的元素，重建一次
+        if self._bar_items and self._bar_geo != (sx, sy, cw, ch):
+            c.delete("all")
+            self._bar_items = {}
+        if not self._bar_items:
+            c.delete("all")
 
         def RX(v):
             return v * sx
@@ -751,8 +899,8 @@ class BatteryOverlay:
         label = ("未连接" if not connected else
                  "已充满" if full else
                  "充电中" if charging else "DS4")
-        f_label = tkfont.Font(font=("Segoe UI", max(6, int(round(9 * sy))), "bold"))
-        f_pct = tkfont.Font(font=("Segoe UI", max(8, int(round(14 * sy))), "bold"))
+        f_label = _bar_font(max(6, int(round(9 * sy))), "bold")
+        f_pct = _bar_font(max(8, int(round(14 * sy))), "bold")
         lh = f_label.metrics("linespace")
         ph = f_pct.metrics("linespace")
 
@@ -761,32 +909,57 @@ class BatteryOverlay:
         cy = RY(y2 - 2) - ph / 2.0        # 数字/进度条的垂直中心
         y_pill = RY(y1 + 3)
 
-        # 3) 左上状态标签（深色胶囊 + 高对比文字）
-        lx = RX(16)
-        lw = f_label.measure(label) + RX(16)
-        round_rect(c, lx, y_pill, lx + lw, y_pill + h_pill, h_pill / 2.0,
-                   fill=BAR_LABEL_BG, outline="")
-        c.create_text(lx + lw / 2.0, y_pill + h_pill / 2.0, text=label,
-                      anchor="center", font=f_label, fill=BAR_LABEL_FG)
-
-        # 4) 进度条轨道 + 填充（百分比数字压在轨道上，数字高度约为轨道的两倍）
         px1, px2 = RX(x1 + 13), RX(x2 - 13)
         py1, py2 = RY(y2 - 10), RY(y2 - 2)
-        round_rect(c, px1, py1, px2, py2, (py2 - py1) / 2.0,
-                   fill="#DCE3EC", outline="")
-        if pct_show is not None and pct_show > 0:
-            fw = (px2 - px1) * pct_show / 100.0
-            round_rect(c, px1, py1, px1 + max(fw, RX(8)), py2,
-                       (py2 - py1) / 2.0, fill=accent, outline="")
-
-        # 5) 百分比数字：加大加粗 + 白色描边（halo），叠在任何颜色上都清晰
+        lx = RX(16)
+        lw = f_label.measure(label) + RX(16)
         txt = "--%" if pct_show is None else "%d%%" % pct_show
         cx = RX(BAR_W // 2)
-        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            c.create_text(cx + dx, cy + dy, text=txt, anchor="center",
-                          font=f_pct, fill=BAR_TEXT_HALO)
-        c.create_text(cx, cy, text=txt, anchor="center", font=f_pct,
-                      fill=BAR_TEXT)
+        fill_w = (px2 - px1) * (pct_show or 0) / 100.0
+        fill_w = max(fill_w, RX(8)) if pct_show else 0.0
+        bg_fill = BAR_TRACK if pct_show is None else _lighten(accent, 0.60)
+        bg_line = _lighten(accent, 0.32) if pct_show is not None else "#CBD5E1"
+
+        # 首次绘制：创建全部元素并记住 id；之后只做原地更新，避免全量重建
+        it = self._bar_items
+        if not it:
+            it["bg"] = round_rect(c, RX(x1), RY(y1), RX(x2), RY(y2),
+                                  RY(BAR_RADIUS - BAR_PAD), fill=bg_fill,
+                                  outline=bg_line, width=1)
+            it["pill"] = round_rect(c, lx, y_pill, lx + lw, y_pill + h_pill,
+                                    h_pill / 2.0, fill=BAR_LABEL_BG, outline="")
+            it["label"] = c.create_text(lx + lw / 2.0, y_pill + h_pill / 2.0,
+                                        text=label, anchor="center",
+                                        font=f_label, fill=BAR_LABEL_FG)
+            it["track"] = round_rect(c, px1, py1, px2, py2, (py2 - py1) / 2.0,
+                                     fill="#DCE3EC", outline="")
+            it["fill"] = round_rect(c, px1, py1, px1 + fill_w, py2,
+                                    (py2 - py1) / 2.0, fill=accent, outline="")
+            for i, (dx, dy) in enumerate(((-1, 0), (1, 0), (0, -1), (0, 1))):
+                it["halo%d" % i] = c.create_text(cx + dx, cy + dy, text=txt,
+                                                 anchor="center", font=f_pct,
+                                                 fill=BAR_TEXT_HALO)
+            it["pct"] = c.create_text(cx, cy, text=txt, anchor="center",
+                                      font=f_pct, fill=BAR_TEXT)
+            self._bar_geo = (sx, sy, cw, ch)
+            return
+
+        # 原地更新（元素 id 复用，避免每次刷新都重建画布元素）
+        c.coords(it["bg"], RX(x1), RY(y1), RX(x2), RY(y2))
+        c.itemconfigure(it["bg"], fill=bg_fill, outline=bg_line)
+        c.coords(it["pill"], lx, y_pill, lx + lw, y_pill + h_pill)
+        c.coords(it["label"], lx + lw / 2.0, y_pill + h_pill / 2.0)
+        c.itemconfigure(it["label"], text=label, font=f_label)
+        c.coords(it["track"], px1, py1, px2, py2)
+        c.coords(it["fill"], px1, py1, px1 + fill_w, py2)
+        c.itemconfigure(it["fill"], fill=accent,
+                        state="normal" if fill_w > 0 else "hidden")
+        for i, (dx, dy) in enumerate(((-1, 0), (1, 0), (0, -1), (0, 1))):
+            c.coords(it["halo%d" % i], cx + dx, cy + dy)
+            c.itemconfigure(it["halo%d" % i], text=txt, font=f_pct)
+        c.coords(it["pct"], cx, cy)
+        c.itemconfigure(it["pct"], text=txt, font=f_pct)
+        self._bar_geo = (sx, sy, cw, ch)
 
     def update_bar(self, percent, charging=False, full=False, connected=True):
         """横条可见时更新内容；数据没变则不重绘。"""
@@ -813,7 +986,7 @@ class BatteryOverlay:
         self.bar_visible = not self.bar_visible
         log(f"电量横条 {'显示' if self.bar_visible else '隐藏'}")
         if self.bar_visible:
-            # 1) 立即绘制（缓存数据；无缓存则显示占位 --%）
+            # 1) 立即绘制（缓存数据；无缓存则显示占位 --%），窗口按需创建
             self.bar_last_key = None
             if self.bar_last_data:
                 self.draw_bar(*self.bar_last_data)
@@ -826,7 +999,8 @@ class BatteryOverlay:
             # 2) 再后台读一次真实电量，读到后由 update_bar 覆盖刷新
             self._spawn_worker("bar")
         else:
-            self.bar_win.withdraw()
+            if self._bar_ready and self.bar_win is not None:
+                self.bar_win.withdraw()
 
     # ---------- 显隐动画 ----------
     def _set_alpha(self, a):
@@ -1139,20 +1313,53 @@ class BatteryOverlay:
         绝不能放在 tkinter 主线程执行：屏幕共享/语音开黑软件同时枚举或占用
         手柄 HID 时，setupapi 枚举可能阻塞数秒到数十秒，主线程一卡就是"程序
         假死"。这里由看门狗线程每秒调用一次，主线程只读 self._connected。
+
+        为避免 1 秒一次的无谓枚举，拔掉手柄后逐步放慢探测频率（最长 5 秒），
+        插着时保持 1 秒以便快速响应。
         """
         if self._dev_poll_busy:
+            return
+        # 未连接时降频轮询：省 CPU，同时仍能在数秒内发现手柄接入
+        if not self._connected and \
+                time.time() - self._last_dev_poll < DEV_POLL_IDLE_SEC:
             return
         self._dev_poll_busy = True
         try:
             self._connected = len(find_ds4_devices()) > 0
+            self._last_dev_poll = time.time()
         except Exception:
             self._connected = False
         finally:
             self._dev_poll_busy = False
             self._dev_state_ready = True
 
+    def _sample_resources(self):
+        """周期性记录资源占用；内存异常增长时自愈重启，避免长跑崩溃。
+
+        这是"防止使用时崩溃"的可观测性基础：句柄/线程/内存趋势写进日志，
+        真出问题时能直接看出是泄漏还是单次峰值。全部走 ctypes，不依赖 pywin32。
+        """
+        self._res_sample_ts = time.time()
+        try:
+            mem_mb, handles = _read_proc_stats()
+            threads = threading.active_count()
+            if mem_mb is not None:
+                log("资源监控: 内存 %.1f MB, 线程 %d, 句柄 %s, 待处理任务 %d"
+                    % (mem_mb, threads,
+                       handles if handles is not None else "n/a",
+                       len(self._worker_todo)))
+            if mem_mb is not None and mem_mb > MEM_LIMIT_MB:
+                log("资源监控: 内存 %.1f MB 超过阈值 %.0f MB，自愈重启"
+                    % (mem_mb, MEM_LIMIT_MB))
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception:
+                    log("自愈重启失败:\n" + traceback.format_exc())
+        except Exception:
+            pass
+
     def _watchdog(self):
-        """看门狗：后台维护设备连接状态；主循环超过 30 秒无心跳则自动重启。
+        """看门狗：后台维护设备连接状态、采样资源占用，并在主循环假死时重启。
 
         屏幕共享/直播等场景若导致主线程被系统调用阻塞，tkinter 会整体假死
         （不抛异常、不写日志，进程仍在但无响应）。看门狗检测到心跳停跳后
@@ -1162,6 +1369,11 @@ class BatteryOverlay:
             time.sleep(DEV_POLL_SEC)
             try:
                 self._poll_devices()
+            except Exception:
+                pass
+            try:
+                if time.time() - self._res_sample_ts >= RES_SAMPLE_SEC:
+                    self._sample_resources()
             except Exception:
                 pass
             if time.time() - self._last_tick > 30:
@@ -1240,7 +1452,7 @@ class BatteryOverlay:
         if self.watch_dev is None or not self._watcher_alive():
             self._spawn_watcher()
 
-    # ---------- 后台线程调度（限并发 + 事件去重） ----------
+    # ---------- 后台线程调度（常驻线程 + 并发限流 + 事件去重） ----------
     def _spawn_watcher(self):
         """仅在没有重开任务进行中时启动监听句柄维护线程。"""
         if self._watcher_busy:
@@ -1248,25 +1460,39 @@ class BatteryOverlay:
         threading.Thread(target=self.ensure_watcher, daemon=True).start()
 
     def _spawn_worker(self, reason):
-        """启动一次 HID 读取线程；超过上限则跳过本次。
+        """把一次 HID 读取排入常驻工作线程。
 
-        屏幕共享/语音软件抢占设备时，每次读取都可能耗时数秒。若不加限制，
-        1 秒轮询会不断堆积线程，最终把进程拖垮（日志里出现的同秒多次弹窗
-        就是这个连锁反应的外在表现）。
+        旧实现每次读取都新建一个线程（含节流上限）。改用**单个常驻线程 +
+        任务队列**后：线程数恒定、无反复创建/销毁开销，且"已有同类任务待处理"
+        时直接跳过，天然完成去重。屏幕共享/语音软件抢占设备时读取可能耗时
+        数秒，此时队列也不会堆积。
         """
         with self._worker_lock:
-            if self._active_workers >= ACTIVE_WORKERS_MAX:
+            if reason in self._worker_pending:
                 return
-            self._active_workers += 1
-        threading.Thread(target=self._worker_entry, args=(reason,),
-                         daemon=True).start()
+            if len(self._worker_pending) >= ACTIVE_WORKERS_MAX:
+                return
+            self._worker_pending.add(reason)
+            self._worker_todo.append(reason)
+        self._worker_wake.set()
 
-    def _worker_entry(self, reason):
-        try:
-            self._battery_worker(reason)
-        finally:
-            with self._worker_lock:
-                self._active_workers = max(0, self._active_workers - 1)
+    def _worker_thread(self):
+        """常驻工作线程：串行执行 HID 读取任务。"""
+        while True:
+            self._worker_wake.wait(1.0)
+            self._worker_wake.clear()
+            while True:
+                with self._worker_lock:
+                    if not self._worker_todo:
+                        break
+                    reason = self._worker_todo.popleft()
+                try:
+                    self._battery_worker(reason)
+                except Exception:
+                    log("worker 线程异常:\n" + traceback.format_exc())
+                finally:
+                    with self._worker_lock:
+                        self._worker_pending.discard(reason)
 
     def _queue(self, payload):
         """入队主线程动作，并对同类事件做时间窗去重。
@@ -1400,8 +1626,13 @@ def main():
     except Exception:
         pass
 
+    # 启动自检信息：排查启动慢/启动失败时一眼能看出环境
+    log("程序启动 pid=%d python=%s frozen=%s"
+        % (os.getpid(), sys.version.split()[0], bool(getattr(sys, "frozen", False))))
+    _maybe_register_faulthandler()
+
     overlay = BatteryOverlay()
-    log(f"程序启动 pid={os.getpid()}")
+    log("界面初始化完成")
 
     if "--preview" in sys.argv:
         pct = None
@@ -1425,6 +1656,7 @@ def main():
         def _preview_bar():
             overlay.bar_visible = True
             overlay.bar_last_key = None
+            overlay._ensure_bar_win()
             overlay.bar_win.deiconify()
             overlay.bar_win.lift()
             overlay.draw_bar(pct, False, False)
@@ -1434,4 +1666,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # 兜底：任何未捕获异常都写日志，并在 10 秒后自我重启一次，
+    # 避免"程序还在但界面没了"这类静默失效。
+    tries = 0
+    while True:
+        try:
+            main()
+            break
+        except SystemExit:
+            raise
+        except BaseException:
+            tries += 1
+            try:
+                log("顶层异常，准备重启:\n" + traceback.format_exc())
+            except Exception:
+                pass
+            if tries > 2:
+                break
+            time.sleep(10)
