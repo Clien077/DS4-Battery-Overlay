@@ -31,6 +31,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 
 try:
     from pywinusb import hid
@@ -85,10 +86,19 @@ ACTIVE_WORKERS_MAX = 2                 # 同时运行的 HID 读取工作线程�
 BURST_WINDOW_SEC = 1.5                 # 同一类提示在此时长内只响应一次（防触发风暴）
 
 # 顶部电量横条（组合键：十字键下 + PS 切换显示）
-BAR_W, BAR_H = 450, 26                 # 细条方案：长度=300*1.5；窗口高度容纳
-                                    # 状态标签(10px)与数字(15px)，进度条本身 6px 细条
+BAR_W = 450                            # 横条宽度
+BAR_H = 40                             # 横条高度：圆角胶囊外框 + 左上标签 + 8px 进度条
 BAR_REFRESH_POLLS = 5                  # 横条显示时每 5 秒自动刷新一次
 BAR_TOP_MARGIN = 8                     # 距屏幕顶部
+BAR_RADIUS = 19                        # 横条左右两端圆角半径（约等于高度的一半）
+BAR_PAD = 1                            # 横条外轮廓与窗口边缘的留白
+
+# 横条配色（比弹窗更亮，保证叠在任何壁纸上都看得清）
+BAR_LABEL_BG = "#111827"               # 状态标签底色
+BAR_LABEL_FG = "#F9FAFB"               # 状态标签文字
+BAR_TRACK = "#E9EDF3"                  # 进度条轨道（浅灰）
+BAR_TEXT = "#0B1220"                   # 百分比数字
+BAR_TEXT_HALO = "#FFFFFF"              # 数字描边（浅色描边提升可读性）
 
 PANEL_BG = "#161A1E"
 PANEL_BORDER = "#2E353D"
@@ -186,6 +196,19 @@ def log(msg):
             f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
     except Exception:
         pass
+
+
+def _lighten(hex_color, amount=0.55):
+    """把颜色按比例向白色混入，得到同色系的浅色底（用作进度条填充）。"""
+    try:
+        h = hex_color.lstrip("#")
+        r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+        r = int(r + (255 - r) * amount)
+        g = int(g + (255 - g) * amount)
+        b = int(b + (255 - b) * amount)
+        return "#%02X%02X%02X" % (r, g, b)
+    except Exception:
+        return hex_color
 
 
 def round_rect(canvas, x1, y1, x2, y2, r, **kw):
@@ -603,6 +626,7 @@ class BatteryOverlay:
         self._active_workers = 0      # 同时运行的 HID 读取线程数
         self._worker_lock = threading.Lock()
         self._last_queued = {}        # 事件类型 -> 上次入队时间（防触发风暴）
+        self.bar_last_data = None     # 横条最近一次真实数据（切换时立即上屏用）
 
         # 看门狗线程：后台维护设备连接状态，并在主循环假死（屏幕共享/直播
         # 场景可能阻塞主线程）时自动重启；启动即做首次枚举，尽快拿到真实状态
@@ -670,53 +694,103 @@ class BatteryOverlay:
 
     # ---------- 顶部电量横条 ----------
     def draw_bar(self, percent, charging=False, full=False, connected=True):
-        """绘制顶部电量横条（严格按参考图方案）：
-        背景完全透明（白色即去色区）；左上状态标签；
-        底部一条随电量变色的进度条；百分比数字居中、与进度条重叠。"""
+        """绘制顶部电量横条。
+
+        美术方案：
+          · 整体为左右两端圆角的胶囊形外框（圆角即"左右边缘圆角"）
+          · 左上角深色胶囊标签：DS4 / 充电中 / 已充满 / 未连接
+          · 中部 8px 浅灰轨道 + 同色系浅色进度填充（随电量变色）
+          · 百分比数字加大加粗，绘制时带浅色描边（halo），叠在任何壁纸上都清晰
+        """
         c = self.bar_canvas
         c.delete("all")
+
+        # DPI 自适应：用画布**实际像素尺寸**等比换算所有坐标。
+        # 关键坑：SetProcessDpiAwareness 之后，Tk 给画布分配的物理像素数会小于
+        # 常量声明的逻辑尺寸（125% 缩放下 450x40 只分到约 448x26），若直接按逻辑
+        # 坐标绘制，内容会被裁掉一截（表现为标签贴顶、底部被切）。
+        try:
+            self.bar_win.update_idletasks()   # 先结算几何，否则 winfo 返回默认值
+        except Exception:
+            pass
+        try:
+            cw = max(120, int(self.bar_win.winfo_width()))
+            ch = max(20, int(self.bar_win.winfo_height()))
+        except Exception:
+            cw, ch = BAR_W, BAR_H
+        sx, sy = cw / float(BAR_W), ch / float(BAR_H)
+
+        def RX(v):
+            return v * sx
+
+        def RY(v):
+            return v * sy
+
         pct_show = None if (not connected or percent is None) \
             else max(0, min(100, int(percent)))
 
         # 进度条颜色随电量：≤20% 红 / 20–60% 黄 / >60% 绿；未连接浅灰
         if pct_show is None:
-            fill = "#D1D5DB"
+            accent = "#9CA3AF"
         elif pct_show <= LOW_BATTERY_PCT:
-            fill = BAT_LOW
+            accent = BAT_LOW
         elif pct_show < 60:
-            fill = BAT_MID
+            accent = BAT_MID
         else:
-            fill = BAT_GOOD
+            accent = BAT_GOOD
 
-        # 左上状态标签（恢复：DS4 / 充电中 / 已充满 / 未连接）
-        if not connected:
-            label = "未连接"
-        elif full:
-            label = "已充满"
-        elif charging:
-            label = "充电中"
-        else:
-            label = "DS4"
-        c.create_text(14, 4, text=label, anchor="w",
-                      font=("Segoe UI", 10, "bold"), fill="#111827")
+        # 1) 圆角胶囊外框（左右两端圆角，即横条本体）
+        x1, y1 = BAR_PAD, BAR_PAD
+        x2, y2 = BAR_W - BAR_PAD, BAR_H - BAR_PAD
+        round_rect(c, RX(x1), RY(y1), RX(x2), RY(y2), RY(BAR_RADIUS - BAR_PAD),
+                   fill=BAR_TRACK if pct_show is None else _lighten(accent, 0.60),
+                   outline=_lighten(accent, 0.32) if pct_show is not None else "#CBD5E1",
+                   width=1)
 
-        # 细进度条：浅灰轨道 + 彩色填充（长度随电量，颜色随电量；未连接浅灰）
-        px1, px2, py1, py2 = 12, BAR_W - 12, 14, 20
-        round_rect(c, px1, py1, px2, py2, 3, fill="#E5E7EB", outline="")
-        if pct_show is not None:
-            fw = (px2 - px1) * pct_show / 100
-            if fw > 0:
-                round_rect(c, px1, py1, px1 + fw, py2, 3,
-                           fill=fill, outline="")
+        # 2) 文字按缩放后的字号排布，避免被窗口边缘裁切
+        label = ("未连接" if not connected else
+                 "已充满" if full else
+                 "充电中" if charging else "DS4")
+        f_label = tkfont.Font(font=("Segoe UI", max(6, int(round(9 * sy))), "bold"))
+        f_pct = tkfont.Font(font=("Segoe UI", max(8, int(round(14 * sy))), "bold"))
+        lh = f_label.metrics("linespace")
+        ph = f_pct.metrics("linespace")
 
-        # 百分比：水平垂直居中于进度条（数字可超出细条，不被完全包裹）
-        txt = "--" if pct_show is None else f"{pct_show}%"
-        c.create_text(BAR_W // 2, (py1 + py2) // 2, text=txt,
-                      anchor="center", font=("Segoe UI", 15, "bold"),
-                      fill="#111827")
+        # 纵向排布：标签胶囊在上，百分比数字+进度条在下
+        h_pill = lh + RY(2)
+        cy = RY(y2 - 2) - ph / 2.0        # 数字/进度条的垂直中心
+        y_pill = RY(y1 + 3)
+
+        # 3) 左上状态标签（深色胶囊 + 高对比文字）
+        lx = RX(16)
+        lw = f_label.measure(label) + RX(16)
+        round_rect(c, lx, y_pill, lx + lw, y_pill + h_pill, h_pill / 2.0,
+                   fill=BAR_LABEL_BG, outline="")
+        c.create_text(lx + lw / 2.0, y_pill + h_pill / 2.0, text=label,
+                      anchor="center", font=f_label, fill=BAR_LABEL_FG)
+
+        # 4) 进度条轨道 + 填充（百分比数字压在轨道上，数字高度约为轨道的两倍）
+        px1, px2 = RX(x1 + 13), RX(x2 - 13)
+        py1, py2 = RY(y2 - 10), RY(y2 - 2)
+        round_rect(c, px1, py1, px2, py2, (py2 - py1) / 2.0,
+                   fill="#DCE3EC", outline="")
+        if pct_show is not None and pct_show > 0:
+            fw = (px2 - px1) * pct_show / 100.0
+            round_rect(c, px1, py1, px1 + max(fw, RX(8)), py2,
+                       (py2 - py1) / 2.0, fill=accent, outline="")
+
+        # 5) 百分比数字：加大加粗 + 白色描边（halo），叠在任何颜色上都清晰
+        txt = "--%" if pct_show is None else "%d%%" % pct_show
+        cx = RX(BAR_W // 2)
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            c.create_text(cx + dx, cy + dy, text=txt, anchor="center",
+                          font=f_pct, fill=BAR_TEXT_HALO)
+        c.create_text(cx, cy, text=txt, anchor="center", font=f_pct,
+                      fill=BAR_TEXT)
 
     def update_bar(self, percent, charging=False, full=False, connected=True):
         """横条可见时更新内容；数据没变则不重绘。"""
+        self.bar_last_data = (percent, charging, full, connected)  # 供即时切换复用
         if not self.bar_visible:
             return
         key = (percent, charging, full, connected)
@@ -730,15 +804,26 @@ class BatteryOverlay:
         self._queue({"kind": "toggle_bar"})
 
     def toggle_bar(self):
-        """组合键切换顶部横条显示/隐藏。"""
+        """组合键切换顶部横条显示/隐藏。
+
+        关键：先用最近一次缓存的电量**立即上屏**，再去后台刷新。
+        打开 HID 句柄读一帧最长要 2 秒（句柄重开时更久），之前是等读完才
+        绘制，所以按组合键后要好几秒才看到横条。
+        """
         self.bar_visible = not self.bar_visible
         log(f"电量横条 {'显示' if self.bar_visible else '隐藏'}")
         if self.bar_visible:
+            # 1) 立即绘制（缓存数据；无缓存则显示占位 --%）
             self.bar_last_key = None
+            if self.bar_last_data:
+                self.draw_bar(*self.bar_last_data)
+            else:
+                self.draw_bar(None, connected=True)   # 中性占位 --%，不误报"未连接"
             self.bar_win.deiconify()
             self.bar_win.attributes("-topmost", True)
             self.bar_win.lift()
-            # 立即读一次电量填充横条
+            self.bar_win.update_idletasks()   # 立刻刷新，不等下一个事件循环
+            # 2) 再后台读一次真实电量，读到后由 update_bar 覆盖刷新
             self._spawn_worker("bar")
         else:
             self.bar_win.withdraw()
