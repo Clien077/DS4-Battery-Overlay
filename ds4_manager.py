@@ -17,6 +17,10 @@ import subprocess
 import sys
 import time
 
+# ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
+__version__ = "1.2.1"
+APP_NAME = "DS4 电量提示"
+
 # 程序目录：打包(exe)后用 exe 所在目录，开发(.py)后用脚本所在目录
 if getattr(sys, "frozen", False):
     BASE = os.path.dirname(sys.executable)
@@ -149,7 +153,9 @@ def menu():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    if "--status" in args:
+    if "--version" in args:
+        print("%s v%s" % (APP_NAME, __version__))
+    elif "--status" in args:
         show_status()
     elif "--start" in args:
         do_start()

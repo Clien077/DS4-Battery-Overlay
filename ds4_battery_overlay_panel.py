@@ -22,6 +22,10 @@ if BASE not in sys.path:
 
 import ds4_manager as mgr  # noqa: E402
 
+# ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
+__version__ = "1.2.1"
+APP_NAME = "DS4 电量提示"
+
 EXE = mgr.SCRIPT_EXE
 AUTOSTART_NAME = "DS4BatteryOverlay"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -83,7 +87,7 @@ def set_autostart(on):
 class Panel(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("DS4 电量提示 · 控制面板")
+        self.title("%s v%s · 控制面板" % (APP_NAME, __version__))
         self.configure(bg=BG)
         self.resizable(False, False)
         self._build()

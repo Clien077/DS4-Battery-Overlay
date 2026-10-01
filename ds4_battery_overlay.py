@@ -116,6 +116,12 @@ BAT_MID = "#F5B700"
 BAT_LOW = "#E5484D"
 MAGIC = "#010101"                      # 透明色键（不参与绘制，用于圆角镂空）
 
+# ---- 版本号：全项目唯一来源 ----
+# 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
+# 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
+__version__ = "1.2.1"
+APP_NAME = "DS4 电量提示"
+
 W, H = 340, 90
 
 # 程序目录：PyInstaller 打包后 __file__ 指向临时解压目录，改用 exe 所在目录
@@ -741,6 +747,8 @@ class BatteryOverlay:
         self._last_dev_poll = 0.0           # 上次设备枚举时间（未连接时降频用）
         self._bar_items = {}                # 横条画布元素 id 缓存（原地更新用）
         self._bar_geo = None                # 上述缓存对应的画布几何
+        self._bar_layout = None             # 上述缓存对应的字号/标签宽度布局
+        self._bar_draw_pending = False      # 几何未就绪时的延后重画标志
 
         # 看门狗线程：后台维护设备连接状态、采样资源占用，并在主循环假死
         # （屏幕共享/直播场景可能阻塞主线程）时自动重启；启动即做首次枚举
@@ -831,6 +839,7 @@ class BatteryOverlay:
         self.bar_canvas = canvas
         self._bar_items = {}
         self._bar_geo = None
+        self._bar_layout = None
         self._bar_ready = True
 
     def draw_bar(self, percent, charging=False, full=False, connected=True):
@@ -861,12 +870,24 @@ class BatteryOverlay:
             cw, ch = BAR_W, BAR_H
         sx, sy = cw / float(BAR_W), ch / float(BAR_H)
 
-        # 画布尺寸/缩放变化（例如切换分辨率）时丢弃缓存的元素，重建一次
-        if self._bar_items and self._bar_geo != (sx, sy, cw, ch):
-            c.delete("all")
-            self._bar_items = {}
-        if not self._bar_items:
-            c.delete("all")
+        # 几何未就绪时绝不绘制：Tk 刚创建/刚 deiconify 时 winfo 可能仍是 1x1
+        # 或默认值，按这种尺寸换算坐标会画出错乱、重叠的图案。
+        # 这里改为延后重画（窗口真正显示后必然就绪）。
+        if abs(cw - BAR_W) > 12 or abs(ch - BAR_H) > 12:
+            if not self._bar_draw_pending:
+                self._bar_draw_pending = True
+
+                def _retry_bar():
+                    self._bar_draw_pending = False
+                    if self.bar_visible:
+                        self.bar_last_key = None
+                        self.draw_bar(percent, charging, full, connected)
+
+                try:
+                    self.root.after(60, _retry_bar)
+                except Exception:
+                    self._bar_draw_pending = False
+            return
 
         def RX(v):
             return v * sx
@@ -887,14 +908,6 @@ class BatteryOverlay:
         else:
             accent = BAT_GOOD
 
-        # 1) 圆角胶囊外框（左右两端圆角，即横条本体）
-        x1, y1 = BAR_PAD, BAR_PAD
-        x2, y2 = BAR_W - BAR_PAD, BAR_H - BAR_PAD
-        round_rect(c, RX(x1), RY(y1), RX(x2), RY(y2), RY(BAR_RADIUS - BAR_PAD),
-                   fill=BAR_TRACK if pct_show is None else _lighten(accent, 0.60),
-                   outline=_lighten(accent, 0.32) if pct_show is not None else "#CBD5E1",
-                   width=1)
-
         # 2) 文字按缩放后的字号排布，避免被窗口边缘裁切
         label = ("未连接" if not connected else
                  "已充满" if full else
@@ -905,10 +918,11 @@ class BatteryOverlay:
         ph = f_pct.metrics("linespace")
 
         # 纵向排布：标签胶囊在上，百分比数字+进度条在下
+        x1, y1 = BAR_PAD, BAR_PAD
+        x2, y2 = BAR_W - BAR_PAD, BAR_H - BAR_PAD
         h_pill = lh + RY(2)
         cy = RY(y2 - 2) - ph / 2.0        # 数字/进度条的垂直中心
         y_pill = RY(y1 + 3)
-
         px1, px2 = RX(x1 + 13), RX(x2 - 13)
         py1, py2 = RY(y2 - 10), RY(y2 - 2)
         lx = RX(16)
@@ -919,47 +933,52 @@ class BatteryOverlay:
         fill_w = max(fill_w, RX(8)) if pct_show else 0.0
         bg_fill = BAR_TRACK if pct_show is None else _lighten(accent, 0.60)
         bg_line = _lighten(accent, 0.32) if pct_show is not None else "#CBD5E1"
+        brad = RY(BAR_RADIUS - BAR_PAD)
 
-        # 首次绘制：创建全部元素并记住 id；之后只做原地更新，避免全量重建
+        # 3) 复用策略：几何/字号/标签宽度任一变化，就整幅重建；其余情况原地更新。
+        #    这样不会出现"部分元素更新、部分还是旧的"造成的错乱与重叠。
         it = self._bar_items
-        if not it:
-            it["bg"] = round_rect(c, RX(x1), RY(y1), RX(x2), RY(y2),
-                                  RY(BAR_RADIUS - BAR_PAD), fill=bg_fill,
-                                  outline=bg_line, width=1)
+        geo = (sx, sy, cw, ch)
+        layout = (round(f_label.cget("size")), round(f_pct.cget("size")),
+                  round(lw, 1), round(h_pill, 1), round(brad, 1))
+        if (not it) or self._bar_geo != geo or self._bar_layout != layout:
+            c.delete("all")      # 整幅重建，元素状态绝对一致
+            it = self._bar_items = {}
+            it["bg"] = round_rect(c, RX(x1), RY(y1), RX(x2), RY(y2), brad,
+                                  fill=bg_fill, outline=bg_line, width=1)
+            it["track"] = round_rect(c, px1, py1, px2, py2, (py2 - py1) / 2.0,
+                                     fill="#DCE3EC", outline="")
+            it["fill"] = round_rect(c, px1, py1, px1 + fill_w, py2,
+                                    (py2 - py1) / 2.0, fill=accent, outline="")
             it["pill"] = round_rect(c, lx, y_pill, lx + lw, y_pill + h_pill,
                                     h_pill / 2.0, fill=BAR_LABEL_BG, outline="")
             it["label"] = c.create_text(lx + lw / 2.0, y_pill + h_pill / 2.0,
                                         text=label, anchor="center",
                                         font=f_label, fill=BAR_LABEL_FG)
-            it["track"] = round_rect(c, px1, py1, px2, py2, (py2 - py1) / 2.0,
-                                     fill="#DCE3EC", outline="")
-            it["fill"] = round_rect(c, px1, py1, px1 + fill_w, py2,
-                                    (py2 - py1) / 2.0, fill=accent, outline="")
             for i, (dx, dy) in enumerate(((-1, 0), (1, 0), (0, -1), (0, 1))):
                 it["halo%d" % i] = c.create_text(cx + dx, cy + dy, text=txt,
                                                  anchor="center", font=f_pct,
                                                  fill=BAR_TEXT_HALO)
             it["pct"] = c.create_text(cx, cy, text=txt, anchor="center",
                                       font=f_pct, fill=BAR_TEXT)
-            self._bar_geo = (sx, sy, cw, ch)
+            if fill_w <= 0:
+                c.itemconfigure(it["fill"], state="hidden")
+            self._bar_geo = geo
+            self._bar_layout = layout
             return
 
-        # 原地更新（元素 id 复用，避免每次刷新都重建画布元素）
-        c.coords(it["bg"], RX(x1), RY(y1), RX(x2), RY(y2))
+        # 4) 原地更新（数值/颜色变化时只改动这两类属性，不重建元素）
         c.itemconfigure(it["bg"], fill=bg_fill, outline=bg_line)
-        c.coords(it["pill"], lx, y_pill, lx + lw, y_pill + h_pill)
-        c.coords(it["label"], lx + lw / 2.0, y_pill + h_pill / 2.0)
-        c.itemconfigure(it["label"], text=label, font=f_label)
-        c.coords(it["track"], px1, py1, px2, py2)
         c.coords(it["fill"], px1, py1, px1 + fill_w, py2)
         c.itemconfigure(it["fill"], fill=accent,
                         state="normal" if fill_w > 0 else "hidden")
+        c.itemconfigure(it["label"], text=label)
+        c.coords(it["label"], lx + lw / 2.0, y_pill + h_pill / 2.0)
         for i, (dx, dy) in enumerate(((-1, 0), (1, 0), (0, -1), (0, 1))):
             c.coords(it["halo%d" % i], cx + dx, cy + dy)
-            c.itemconfigure(it["halo%d" % i], text=txt, font=f_pct)
+            c.itemconfigure(it["halo%d" % i], text=txt)
         c.coords(it["pct"], cx, cy)
-        c.itemconfigure(it["pct"], text=txt, font=f_pct)
-        self._bar_geo = (sx, sy, cw, ch)
+        c.itemconfigure(it["pct"], text=txt)
 
     def update_bar(self, percent, charging=False, full=False, connected=True):
         """横条可见时更新内容；数据没变则不重绘。"""
@@ -1605,6 +1624,9 @@ def remove_autostart():
 
 
 def main():
+    if "--version" in sys.argv:
+        print("%s v%s" % (APP_NAME, __version__))
+        return
     if "--autostart" in sys.argv:
         install_autostart()
         return
@@ -1627,8 +1649,9 @@ def main():
         pass
 
     # 启动自检信息：排查启动慢/启动失败时一眼能看出环境
-    log("程序启动 pid=%d python=%s frozen=%s"
-        % (os.getpid(), sys.version.split()[0], bool(getattr(sys, "frozen", False))))
+    log("程序启动 v%s pid=%d python=%s frozen=%s"
+        % (__version__, os.getpid(), sys.version.split()[0],
+           bool(getattr(sys, "frozen", False))))
     _maybe_register_faulthandler()
 
     overlay = BatteryOverlay()
