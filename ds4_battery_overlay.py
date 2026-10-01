@@ -325,12 +325,23 @@ def _lighten(hex_color, amount=0.55):
         return hex_color
 
 
+def round_rect_points(x1, y1, x2, y2, r):
+    """圆角矩形（胶囊）的顶点序列。
+
+    单独抽出来是为了"原地更新"：Tk 的 coords() 是按点替换的，
+    若只传 4 个数值给一个 24 点多边形，多边形会被解释成
+    (x1,y1,x2,y2) 四点、塌缩成一条线——填充条会整个消失。
+    所以更新时必须重算整组点。
+    """
+    return [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+
+
 def round_rect(canvas, x1, y1, x2, y2, r, **kw):
     """在 canvas 上画一个圆角矩形（pill 形）。"""
-    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-           x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-           x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return canvas.create_polygon(pts, smooth=True, **kw)
+    return canvas.create_polygon(round_rect_points(x1, y1, x2, y2, r),
+                                 smooth=True, **kw)
 
 
 def find_ds4_devices():
@@ -743,6 +754,7 @@ class BatteryOverlay:
         self._worker_wake = threading.Event()     # 唤醒常驻工作线程
         self._last_queued = {}        # 事件类型 -> 上次入队时间（防触发风暴）
         self.bar_last_data = None     # 横条最近一次真实数据（切换时立即上屏用）
+        self.bar_last_pct = None      # 横条最近一次已知电量（跨断开保留，避免灰轨道）
         self._res_sample_ts = time.time()   # 资源自监控采样时间戳
         self._last_dev_poll = 0.0           # 上次设备枚举时间（未连接时降频用）
         self._bar_items = {}                # 横条画布元素 id 缓存（原地更新用）
@@ -968,8 +980,12 @@ class BatteryOverlay:
             return
 
         # 4) 原地更新（数值/颜色变化时只改动这两类属性，不重建元素）
+        #    关键：多边形必须传"整组点"，只传 4 个数值会把它塌缩成一条线
+        #    （这正是"进度条填充消失、只剩灰轨道"的原因）。
         c.itemconfigure(it["bg"], fill=bg_fill, outline=bg_line)
-        c.coords(it["fill"], px1, py1, px1 + fill_w, py2)
+        c.coords(it["fill"],
+                 *round_rect_points(px1, py1, px1 + fill_w, py2,
+                                    (py2 - py1) / 2.0))
         c.itemconfigure(it["fill"], fill=accent,
                         state="normal" if fill_w > 0 else "hidden")
         c.itemconfigure(it["label"], text=label)
@@ -1005,10 +1021,13 @@ class BatteryOverlay:
         self.bar_visible = not self.bar_visible
         log(f"电量横条 {'显示' if self.bar_visible else '隐藏'}")
         if self.bar_visible:
-            # 1) 立即绘制（缓存数据；无缓存则显示占位 --%），窗口按需创建
+            # 1) 立即绘制：优先用"上次已知电量"，避免刚唤出时显示成灰轨道；
+            #    完全没有历史数据时才是 --% 占位
             self.bar_last_key = None
             if self.bar_last_data:
                 self.draw_bar(*self.bar_last_data)
+            elif self.bar_last_pct is not None:
+                self.draw_bar(self.bar_last_pct, False, False, True)
             else:
                 self.draw_bar(None, connected=True)   # 中性占位 --%，不误报"未连接"
             self.bar_win.deiconify()
@@ -1546,8 +1565,15 @@ class BatteryOverlay:
         pct = payload.get("pct")
         reason = payload.get("reason", "plug")
         if reason == "bar":
-            # 横条刷新：只更新横条，不弹窗
-            self.update_bar(pct, payload.get("charging", False),
+            # 横条刷新：只更新横条，不弹窗。
+            # 本次读不到电量时沿用"上次已知电量"，避免横条显示成灰轨道。
+            if pct is not None:
+                self.bar_last_pct = pct
+            elif self.bar_last_pct is None:
+                bd = self.bar_last_data
+                self.bar_last_pct = bd[0] if bd else None
+            self.update_bar(pct if pct is not None else self.bar_last_pct,
+                            payload.get("charging", False),
                             payload.get("full", False))
             return
         if reason == "lowcheck":
