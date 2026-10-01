@@ -60,6 +60,7 @@ HOLD_SECONDS = 3.0                     # 电量显示保持时间（秒）
 HOLD_PS_SECONDS = 2.0                  # PS 双击弹电量窗保持时间（秒）
 HOLD_LOW_SECONDS = 3.0                 # 低电量提示保持时间（秒）
 HOLD_DISCONNECT_SECONDS = 2.5          # 拔出提示保持时间（秒）
+HOLD_POWER_SECONDS = 1.5              # 接入/拔出电源提示保持时间（秒）
 LOW_BATTERY_PCT = 20                   # 低电量阈值（%）
 LOW_CHECK_INTERVAL_POLLS = 30          # 低电量周期检查（每 30 次轮询 ≈ 30 秒）
 FADE_IN_MS = 150                       # 淡入总时长（毫秒；与淡出合计 0.5 秒）
@@ -67,8 +68,25 @@ FADE_OUT_MS = 350                      # 淡出总时长（毫秒；与淡入合
 POLL_MS = 1000                         # 手柄接入检测轮询间隔（毫秒）
 READ_TIMEOUT = 2.0                     # 读取电量超时（秒）
 
+# ---- 与屏幕共享/语音开黑软件（黑盒语音、Sunshine、OBS 等）共存相关的参数 ----
+# 这类软件会同时枚举/占用 DS4 的 HID 接口，导致：
+#   · HID 枚举(setupapi)在主线程上长时间阻塞 → tkinter 假死
+#   · 常驻句柄的读取线程虽仍 alive，但系统调用已被卡住 → PS 键/电量再也不触发
+# 因此：所有 HID 枚举都放到后台线程；用 is_plugged() 主动探测句柄健康；
+# 连续失败时指数退避，避免与共享软件互相抢设备形成风暴。
+DEV_POLL_SEC = 1.0                     # 后台手柄连接检测周期（秒）
+WATCH_PROBE_SEC = 5.0                  # 常驻句柄健康探测周期（秒）
+WATCH_QUIET_SEC = 45.0                 # 有报告时的静默上限；超时强制重开（秒）
+WATCH_OPEN_TIMEOUT_SEC = 8.0           # 单次打开句柄的时限；超时视为卡住并放弃该次（秒）
+WATCH_OPEN_HANG_COOLDOWN_SEC = 60.0    # 打开超时后的全局冷却：期间不再尝试，防卡死线程堆积（秒）
+WATCH_FAIL_BACKOFF_BASE = 3.0          # 打开失败退避基数（秒）：3·2^(n-1)
+WATCH_FAIL_BACKOFF_MAX = 60.0          # 退避上限（秒）
+ACTIVE_WORKERS_MAX = 2                 # 同时运行的 HID 读取工作线程上限（防线程爆炸）
+BURST_WINDOW_SEC = 1.5                 # 同一类提示在此时长内只响应一次（防触发风暴）
+
 # 顶部电量横条（组合键：十字键下 + PS 切换显示）
-BAR_W, BAR_H = 300, 50
+BAR_W, BAR_H = 450, 26                 # 细条方案：长度=300*1.5；窗口高度容纳
+                                    # 状态标签(10px)与数字(15px)，进度条本身 6px 细条
 BAR_REFRESH_POLLS = 5                  # 横条显示时每 5 秒自动刷新一次
 BAR_TOP_MARGIN = 8                     # 距屏幕顶部
 
@@ -100,6 +118,8 @@ LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 # 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
 STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
 _last_wireless_pct = None
+_last_save_ts = 0.0       # 状态文件写入限频时间戳
+_last_saved_pct = None    # 状态文件已保存值（去重）
 
 
 def _load_state():
@@ -116,11 +136,22 @@ def _load_state():
 
 
 def _save_state():
-    """保存无线电量记忆到状态文件。"""
+    """保存无线电量记忆到状态文件。
+
+    限频：2 秒内不重复写、值未变化不写——避免回调线程高频 I/O
+    （屏幕共享/直播等场景下磁盘被占用时，写入阻塞会拖垮读取回调）。
+    """
+    global _last_save_ts, _last_saved_pct
+    if time.time() - _last_save_ts < 2.0:
+        return
+    if _last_saved_pct == _last_wireless_pct:
+        return
     try:
         import json
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump({"wireless_pct": _last_wireless_pct}, f)
+        _last_save_ts = time.time()
+        _last_saved_pct = _last_wireless_pct
     except Exception:
         pass
 
@@ -342,6 +373,46 @@ def dpad_down(data, dpi=None):
     return (data[dpi] & 0x0F) == POV_DOWN
 
 
+_open_hang_until = 0.0   # 上次打开超时后的全局冷却截止时间（monotonic）
+
+
+def _open_device_bounded(dev, timeout=WATCH_OPEN_TIMEOUT_SEC):
+    """带时限地打开手柄句柄。
+
+    屏幕共享 / 语音开黑软件同时占用手柄 HID 时，dev.open() 可能在
+    CreateFile / setupapi 里长时间阻塞（实测可卡住数十秒甚至更久），
+    历史上这一步会连带把 tkinter 主线程拖死。这里把打开动作放进独立
+    线程并限时等待：超时即放弃，句柄标记为不健康，稍后退避重试。
+
+    注意：Python 无法中断已陷入系统调用的线程，超时后那个线程会一直
+    卡着。因此超时后进入全局冷却（冷却期内不再尝试打开），避免重试
+    不断产生新的卡死线程。
+    返回 True 表示在时限内打开成功。
+    """
+    global _open_hang_until
+    if time.monotonic() < _open_hang_until:
+        return False
+    done = threading.Event()
+    ok = []
+
+    def worker():
+        try:
+            dev.open()
+            ok.append(bool(dev.is_opened()))
+        except Exception:
+            ok.append(False)
+        finally:
+            done.set()
+
+    threading.Thread(target=worker, daemon=True).start()
+    if not done.wait(timeout):
+        _open_hang_until = time.monotonic() + WATCH_OPEN_HANG_COOLDOWN_SEC
+        log(f"打开手柄句柄超时(>{timeout:.0f}s)，判定为被占用/卡住，"
+            f"进入 {WATCH_OPEN_HANG_COOLDOWN_SEC:.0f} 秒冷却")
+        return False
+    return bool(ok and ok[0])
+
+
 def read_battery_from_device(dev):
     """
     读取 DS4 电量。
@@ -379,8 +450,7 @@ def read_battery_from_device(dev):
         # 先注册回调再打开：设备打开瞬间送出的首帧报告即可被捕获
         # （DS4 默认只在状态变化时发报告，不会持续刷屏）
         dev.set_raw_data_handler(handler)
-        dev.open()
-        opened = dev.is_opened()
+        opened = _open_device_bounded(dev)
         if opened:
             if is_bt_device(dev):
                 activate_bt_full_report(dev)
@@ -437,8 +507,7 @@ def read_status_from_device(dev):
     opened = False
     try:
         dev.set_raw_data_handler(handler)
-        dev.open()
-        opened = dev.is_opened()
+        opened = _open_device_bounded(dev)
         if opened:
             if is_bt_device(dev):
                 activate_bt_full_report(dev)
@@ -498,8 +567,7 @@ class BatteryOverlay:
                                     bg=MAGIC, highlightthickness=0)
         self.bar_canvas.pack()
         # 右键点击横条 = 关闭横条
-        self.bar_canvas.bind("<Button-3>",
-                             lambda e: self.result_q.put({"kind": "toggle_bar"}))
+        self.bar_canvas.bind("<Button-3>", lambda e: self._toggle_bar_event())
 
         self.state = "hidden"      # hidden / shown / fading
         self.alpha = 0.0
@@ -516,6 +584,29 @@ class BatteryOverlay:
         self.low_warned = False  # 本轮低电量是否已提示过（用于周期检查去重）
         self.poll_count = 0      # 低电量周期检查计数器
         self._last_lowcheck = None  # 上次例行检查的(电量,充电,充满)，用于去重日志
+        self.ps_cooldown_until = 0.0  # PS 双击/组合键触发冷却（防误触发风暴）
+        self._watch_retry_ts = 0.0    # 监听句柄重开退避时间戳（秒）
+        self._watcher_busy = False    # 后台重开句柄进行中标志（防并发重开）
+        self._open_fail_streak = 0    # 连续打开失败次数（指数退避用）
+        self._longframe_log_ts = 0.0  # 长帧异常警告日志限频时间戳（秒）
+        self._last_cable = None    # 蓝牙电源线状态基线（接入/拔出电源提示）
+        self._last_tick = time.time() # 主循环心跳（看门狗据此判断是否假死）
+
+        # ---- 与屏幕共享/语音软件共存用的状态 ----
+        self._dev_poll_busy = False   # 后台 HID 枚举进行中（枚举被占用时会很慢）
+        self._dev_state_ready = False # 后台是否已完成首次枚举（主循环据此决定基线）
+        self._connected = False       # 由后台线程维护的连接状态（主线程只读缓存）
+        self._last_report_ts = 0.0    # 常驻句柄最近一次收到报告的时间
+        self._probe_ok_ts = 0.0       # 最近一次 is_plugged() 探测成功的时间
+        self._probe_fail_streak = 0   # is_plugged() 连续失败次数
+        self._reopen_log_ts = 0.0     # 句柄重开日志限频（避免刷屏）
+        self._active_workers = 0      # 同时运行的 HID 读取线程数
+        self._worker_lock = threading.Lock()
+        self._last_queued = {}        # 事件类型 -> 上次入队时间（防触发风暴）
+
+        # 看门狗线程：后台维护设备连接状态，并在主循环假死（屏幕共享/直播
+        # 场景可能阻塞主线程）时自动重启；启动即做首次枚举，尽快拿到真实状态
+        threading.Thread(target=self._watchdog, daemon=True).start()
 
         self.root.after(300, self.poll_loop)
 
@@ -597,7 +688,7 @@ class BatteryOverlay:
         else:
             fill = BAT_GOOD
 
-        # 左上状态标签（参考图：黑色小字）
+        # 左上状态标签（恢复：DS4 / 充电中 / 已充满 / 未连接）
         if not connected:
             label = "未连接"
         elif full:
@@ -606,22 +697,22 @@ class BatteryOverlay:
             label = "充电中"
         else:
             label = "DS4"
-        c.create_text(14, 8, text=label, anchor="w",
-                      font=("Segoe UI", 11, "bold"), fill="#111827")
+        c.create_text(14, 4, text=label, anchor="w",
+                      font=("Segoe UI", 10, "bold"), fill="#111827")
 
-        # 底部进度条：浅灰轨道 + 彩色填充（长度随电量，颜色随电量）
-        px1, px2, py1, py2 = 12, BAR_W - 12, 30, 46
-        round_rect(c, px1, py1, px2, py2, 8, fill="#E5E7EB", outline="")
+        # 细进度条：浅灰轨道 + 彩色填充（长度随电量，颜色随电量；未连接浅灰）
+        px1, px2, py1, py2 = 12, BAR_W - 12, 14, 20
+        round_rect(c, px1, py1, px2, py2, 3, fill="#E5E7EB", outline="")
         if pct_show is not None:
             fw = (px2 - px1) * pct_show / 100
             if fw > 0:
-                round_rect(c, px1, py1, px1 + fw, py2, 8,
+                round_rect(c, px1, py1, px1 + fw, py2, 3,
                            fill=fill, outline="")
 
-        # 百分比：水平居中、垂直居中于进度条（与电量条重叠）
+        # 百分比：水平垂直居中于进度条（数字可超出细条，不被完全包裹）
         txt = "--" if pct_show is None else f"{pct_show}%"
-        c.create_text(BAR_W // 2, py1 + (py2 - py1) // 2, text=txt,
-                      anchor="center", font=("Segoe UI", 18, "bold"),
+        c.create_text(BAR_W // 2, (py1 + py2) // 2, text=txt,
+                      anchor="center", font=("Segoe UI", 15, "bold"),
                       fill="#111827")
 
     def update_bar(self, percent, charging=False, full=False, connected=True):
@@ -634,6 +725,10 @@ class BatteryOverlay:
         self.bar_last_key = key
         self.draw_bar(percent, charging, full, connected)
 
+    def _toggle_bar_event(self):
+        """右键点击横条：走与组合键相同的去重入队路径。"""
+        self._queue({"kind": "toggle_bar"})
+
     def toggle_bar(self):
         """组合键切换顶部横条显示/隐藏。"""
         self.bar_visible = not self.bar_visible
@@ -644,8 +739,7 @@ class BatteryOverlay:
             self.bar_win.attributes("-topmost", True)
             self.bar_win.lift()
             # 立即读一次电量填充横条
-            threading.Thread(target=self._battery_worker, args=("bar",),
-                             daemon=True).start()
+            self._spawn_worker("bar")
         else:
             self.bar_win.withdraw()
 
@@ -700,6 +794,13 @@ class BatteryOverlay:
         log("弹出断开提示窗")
         self._present(HOLD_DISCONNECT_SECONDS)
 
+    def show_power(self, plugged):
+        """蓝牙连接时接入/拔出电源提示（约 1.5 秒）。"""
+        title = "接入电源" if plugged else "拔出电源"
+        self.draw_message(title, "DS4")
+        log(f"弹出{title}提示窗")
+        self._present(HOLD_POWER_SECONDS)
+
     def fade_out(self):
         if self.state != "shown":
             return
@@ -732,28 +833,27 @@ class BatteryOverlay:
     # ---------- 接入检测 ----------
     def on_connect(self):
         log("手柄接入 -> 读取电量")
-        threading.Thread(target=self._battery_worker, args=("plug",),
-                         daemon=True).start()
+        self._spawn_worker("plug")
 
     def _battery_worker(self, reason="plug"):
         try:
             info = read_ds4_status()
             if info is None:
                 log(f"电量读取失败(reason={reason}) -> 弹窗显示 --%")
-                self.result_q.put({"kind": "battery", "pct": None,
-                                   "reason": reason})
+                self._queue({"kind": "battery", "pct": None,
+                             "reason": reason})
             elif reason == "lowcheck":
                 # 例行检查只在"状态有变化"或"低电量"时写日志，避免刷屏
                 note = (info["pct"], info["charging"], info["full"])
                 if note != self._last_lowcheck or info["pct"] <= LOW_BATTERY_PCT:
                     log(f"电量读取(reason={reason}) -> {info}")
                     self._last_lowcheck = note
-                self.result_q.put({"kind": "battery", "reason": reason,
-                                   **info})
+                self._queue({"kind": "battery", "reason": reason,
+                             **info})
             else:
                 log(f"电量读取(reason={reason}) -> {info}")
-                self.result_q.put({"kind": "battery", "reason": reason,
-                                   **info})
+                self._queue({"kind": "battery", "reason": reason,
+                             **info})
         except Exception:
             log("battery_worker 异常:\n" + traceback.format_exc())
 
@@ -765,29 +865,54 @@ class BatteryOverlay:
         · 十字键下 + PS 组合键 → 切换顶部电量横条
         """
         try:
+            self._last_report_ts = time.monotonic()   # 句柄存活证据（健康探测用）
             offs = report_offsets(data)
             if offs is None:
                 return
             if data[0] == 0x01 and self.watch_dev is not None and \
                     is_bt_device(self.watch_dev):
                 return  # 蓝牙设备激活前的位置报告(0x01)无按键，忽略
-            _, psi = offs
+            # 长帧扩展报告（547B）：b9 为数据流字节，但实测 bit0 仍是 PS 键
+            # （按下时 bit0=1，23:59:43 双击瞬间 b9=0x4D 佐证）。只提示不阻断。
+            if len(data) > 78:
+                now = time.monotonic()
+                if now - self._longframe_log_ts > 300.0:
+                    self._longframe_log_ts = now
+                    log(f"提示: 手柄报告为扩展格式(长度={len(data)}B)，"
+                        f"若 PS 键异常请重启手柄或重新配对")
+            bi, psi = offs
             if len(data) <= psi:
                 return
+            # 电源线状态检测（蓝牙 0x11 / 扩展 547 报告）：b32 bit4 = 线缆标志，
+            # 变化即弹接入/拔出电源提示（1.5 秒）。有线 0x01 报告不检测。
+            if data[0] == 0x11 and len(data) > bi:
+                cable_now = bool(data[bi] & 0x10)
+                if self._last_cable is not None and cable_now != self._last_cable:
+                    self._queue({"kind": "power_plug" if cable_now
+                                 else "power_unplug"})
+                self._last_cable = cable_now
             ps = bool(data[psi] & PS_BUTTON_MASK)
             if ps and not self.ps_prev:          # PS 上升沿
+                now = time.monotonic()
                 if dpad_down(data):
-                    # 组合键：十字键下 + PS → 切换横条
-                    log("组合键(十字键下+PS) -> 切换电量横条")
-                    self.result_q.put({"kind": "toggle_bar"})
+                    # 组合键：十字键下 + PS → 切换横条（冷却 1s 防误触连发）
                     self.last_ps_time = None      # 不计入双击判定
+                    if now < self.ps_cooldown_until:
+                        pass                      # 冷却中，忽略
+                    else:
+                        log("组合键(十字键下+PS) -> 切换电量横条")
+                        self._queue({"kind": "toggle_bar"})
+                        self.ps_cooldown_until = now + 1.0
                 else:
-                    now = time.monotonic()
-                    if self.last_ps_time is not None and \
+                    if now < self.ps_cooldown_until:
+                        # 触发冷却中：清掉双击计时，防止抖动连续误触发
+                        self.last_ps_time = None
+                    elif self.last_ps_time is not None and \
                             (now - self.last_ps_time) * 1000 <= DOUBLE_PRESS_MS:
-                        # 双击 PS → 弹电量
+                        # 双击 PS → 弹电量（触发后冷却 1.5 秒）
                         log("PS 双击 -> 弹出电量")
                         self.last_ps_time = None
+                        self.ps_cooldown_until = now + 1.5
                         bi, _ = offs
                         if len(data) > bi:
                             if data[0] == 0x11:
@@ -799,11 +924,11 @@ class BatteryOverlay:
                             raw = data[bi]
                             if not (raw & 0x10) or (raw & 0x0F) <= 10:
                                 _remember_wireless(info["pct"])
-                            self.result_q.put({"kind": "battery",
-                                               "reason": "ps", **info})
+                            self._queue({"kind": "battery",
+                                         "reason": "ps", **info})
                         else:
-                            self.result_q.put({"kind": "battery", "pct": None,
-                                               "reason": "ps"})
+                            self._queue({"kind": "battery", "pct": None,
+                                         "reason": "ps"})
                     else:
                         # 第一次按下，等双击
                         self.last_ps_time = now
@@ -819,13 +944,18 @@ class BatteryOverlay:
                 pass
             self.watch_dev = None
             self.ps_prev = False
+            self.last_ps_time = None   # 重开后清空双击计时，防止首帧误触发
 
     def _watcher_alive(self):
         """监听句柄是否仍健康。
 
-        pywinusb 的 is_opened() 只是内部标志，拔线后不会自动变 False；
-        但内部读取线程在设备断开时（错误 1167）会退出，is_active() 变 False，
-        用它作为"手柄还在不在"的可靠信号。
+        判定依据（任一不满足即视为失效 → 重开）：
+        1. is_opened()：pywinusb 内部标志；
+        2. 内部读取线程 is_active()：设备断开（错误 1167）时线程会退出；
+        3. is_plugged()：主动探测设备是否仍在系统里。屏幕共享/语音开黑
+           软件抢走设备后，前两项都可能仍为 True，只有主动探测能发现；
+        4. 报告静默：曾经收到过报告，但已静默超过 WATCH_QUIET_SEC
+           （USB 下 DS4 至少每 5ms 刷一帧，静默即说明底层已卡住）。
         """
         dev = self.watch_dev
         if dev is None:
@@ -835,34 +965,127 @@ class BatteryOverlay:
                 return False
             reader = getattr(dev, "_HidDevice__reading_thread", None)
             if reader is not None and hasattr(reader, "is_active"):
-                return bool(reader.is_active())
+                if not reader.is_active():
+                    return False
+            # 主动探测：设备是否还在（被共享软件独占/拔出时为 False）
+            try:
+                if not dev.is_plugged():
+                    self._probe_fail_streak += 1
+                    return False
+                self._probe_ok_ts = time.monotonic()
+                self._probe_fail_streak = 0
+            except Exception:
+                self._probe_fail_streak += 1
+                return False
+            # 静默超时：只有当本句柄确实收到过报告时，才把"长时间没报告"当故障
+            if self._last_report_ts and \
+                    time.monotonic() - self._last_report_ts > WATCH_QUIET_SEC:
+                log(f"监听句柄静默超过 {WATCH_QUIET_SEC:.0f} 秒，判定失效并重开")
+                self._last_report_ts = 0.0
+                return False
             return True
         except Exception:
             return False
 
     def ensure_watcher(self):
-        """维持一个常开手柄句柄，用于监听 PS 键；设备拔出/重插时自动重开。"""
-        devices = find_ds4_devices()
-        paths = {d.device_path for d in devices}
-        if self.watch_dev is not None:
-            if self.watch_dev.device_path in paths and self._watcher_alive():
-                return
-            # 路径对不上，或句柄已失效（快速拔插漏检）→ 重开
-            log("监听句柄失效，重开手柄句柄")
-            self.close_watcher()
-        if not devices:
+        """维持一个常开手柄句柄，用于监听 PS 键；设备拔出/重插时自动重开。
+
+        必须在后台线程调用（主线程绝不执行 HID 打开/枚举——屏幕共享、语音
+        开黑类软件同时操作手柄 HID 时，dev.open()/setupapi 枚举可能阻塞数十
+        秒，会卡死 tkinter 主循环）。打开动作本身也带时限，连续失败时指数
+        退避（3→6→12→…→60 秒），避免与共享软件互相抢设备形成风暴。
+        """
+        if self._watcher_busy:
             return
-        dev = devices[0]
+        self._watcher_busy = True
         try:
-            dev.set_raw_data_handler(self.ps_handler)
-            dev.open()
-            if dev.is_opened():
-                if is_bt_device(dev):
-                    activate_bt_full_report(dev)
-                self.watch_dev = dev
-                self.ps_prev = False
+            now = time.time()
+            devices = find_ds4_devices()
+            paths = {d.device_path for d in devices}
+            if self.watch_dev is not None:
+                if self.watch_dev.device_path in paths and self._watcher_alive():
+                    self._watch_retry_ts = 0.0
+                    self._open_fail_streak = 0
+                    return
+                if now < self._watch_retry_ts:
+                    return      # 退避中，稍后再试
+                # 路径对不上，或句柄已失效（被共享软件抢占/快速拔插漏检）→ 重开
+                if now - self._reopen_log_ts > 30.0:
+                    self._reopen_log_ts = now
+                    log("监听句柄失效，重开手柄句柄")
+                self.close_watcher()
+            if not devices:
+                return
+            if now < self._watch_retry_ts:
+                return
+            dev = devices[0]
+            # 先给一个保守的退避时间，成功后再清零：即使下面挂住/异常也不会重开风暴
+            self._open_fail_streak += 1
+            backoff = min(WATCH_FAIL_BACKOFF_BASE * (2 ** (self._open_fail_streak - 1)),
+                          WATCH_FAIL_BACKOFF_MAX)
+            self._watch_retry_ts = now + backoff
+            try:
+                dev.set_raw_data_handler(self.ps_handler)
+                if _open_device_bounded(dev):
+                    if is_bt_device(dev):
+                        activate_bt_full_report(dev)
+                    self.watch_dev = dev
+                    self.ps_prev = False
+                    self._last_report_ts = 0.0
+                    self._probe_ok_ts = time.monotonic()
+                    self._watch_retry_ts = 0.0
+                    self._open_fail_streak = 0
+                else:
+                    log(f"打开手柄句柄失败(第 {self._open_fail_streak} 次)，"
+                        f"{backoff:.0f} 秒后重试"
+                        f"（若正在使用屏幕共享/语音开黑软件，多半是设备被其占用）")
+                    try:
+                        dev.close()
+                    except Exception:
+                        pass
+            except Exception:
+                log("ensure_watcher 打开失败:\n" + traceback.format_exc())
+        finally:
+            self._watcher_busy = False
+
+    def _poll_devices(self):
+        """后台枚举手柄并更新连接状态。
+
+        绝不能放在 tkinter 主线程执行：屏幕共享/语音开黑软件同时枚举或占用
+        手柄 HID 时，setupapi 枚举可能阻塞数秒到数十秒，主线程一卡就是"程序
+        假死"。这里由看门狗线程每秒调用一次，主线程只读 self._connected。
+        """
+        if self._dev_poll_busy:
+            return
+        self._dev_poll_busy = True
+        try:
+            self._connected = len(find_ds4_devices()) > 0
         except Exception:
-            log("ensure_watcher 打开失败:\n" + traceback.format_exc())
+            self._connected = False
+        finally:
+            self._dev_poll_busy = False
+            self._dev_state_ready = True
+
+    def _watchdog(self):
+        """看门狗：后台维护设备连接状态；主循环超过 30 秒无心跳则自动重启。
+
+        屏幕共享/直播等场景若导致主线程被系统调用阻塞，tkinter 会整体假死
+        （不抛异常、不写日志，进程仍在但无响应）。看门狗检测到心跳停跳后
+        原地重启进程（os.execv 同进程替换，单实例互斥随之释放），实现自愈。
+        """
+        while True:
+            time.sleep(DEV_POLL_SEC)
+            try:
+                self._poll_devices()
+            except Exception:
+                pass
+            if time.time() - self._last_tick > 30:
+                log("看门狗: 主循环疑似卡死(>30秒无心跳)，自动重启")
+                try:
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+                except Exception:
+                    log("看门狗重启失败:\n" + traceback.format_exc())
+                    return
 
     def poll_loop(self):
         """轮询主循环：任何异常都记录日志并继续调度，绝不静默停摆。"""
@@ -874,18 +1097,25 @@ class BatteryOverlay:
             self.root.after(POLL_MS, self.poll_loop)
 
     def _poll_tick(self):
-        # 先处理队列消息（主线程，tkinter 线程安全）
+        self._last_tick = time.time()   # 心跳：看门狗据此判断主循环是否假死
+        # 先处理队列消息（主线程，tkinter 线程安全；单轮限次防极端积压）
         try:
+            drained = 0
             while True:
                 self._dispatch(self.result_q.get_nowait())
+                drained += 1
+                if drained > 30:
+                    break
         except queue.Empty:
             pass
 
-        try:
-            connected = len(find_ds4_devices()) > 0
-        except Exception:
-            connected = False
+        # 连接状态来自后台枚举缓存：主线程绝不直接做 HID 枚举（会被共享软件拖死）
+        connected = self._connected
 
+        if not self._dev_state_ready:
+            # 后台首次枚举还没完成：本轮不作为基线，等拿到真实状态再判断，
+            # 避免把手柄一直插着的开机场景误判成"未连接"而漏掉启动弹窗
+            return
         if self.first_poll:
             # 启动时手柄已连接：也弹一次
             self.first_poll = False
@@ -898,35 +1128,76 @@ class BatteryOverlay:
             elif not connected and self.prev_connected:
                 # 刚拔出/断开 → 弹出断开提示，并立即释放失效句柄
                 log("手柄拔出 -> 弹出断开提示")
-                self.result_q.put({"kind": "disconnect"})
+                self._queue({"kind": "disconnect"})
                 self.low_warned = False
                 self.close_watcher()
         self.prev_connected = connected
 
         # 快速拔插兜底：1 秒轮询可能漏掉瞬时断开，此时连接状态仍是 True，
-        # 但监听句柄的读取线程已退出 → 判定为"重插"，重新弹电量并重开句柄
+        # 但监听句柄的读取线程已退出 → 判定为"重插"，重新弹电量并重开句柄。
+        # 被屏幕共享/语音软件抢走设备时也走这条路径恢复。
         if connected:
             if self.watch_dev is not None and not self._watcher_alive():
-                log("检测到手柄重插(监听句柄失效) -> 重新弹电量")
+                log("检测到手柄重插/句柄被抢占 -> 重新弹电量")
                 self.close_watcher()
                 self.on_connect()
 
         # 低电量周期检查（约每 30 秒一次，避免过度打扰）
         self.poll_count = (self.poll_count + 1) % LOW_CHECK_INTERVAL_POLLS
         if connected and self.poll_count == 0:
-            threading.Thread(target=self._battery_worker,
-                             args=("lowcheck",), daemon=True).start()
+            self._spawn_worker("lowcheck")
 
         # 横条实时刷新（显示时每 5 秒读一次电量）
         if self.bar_visible and self.poll_count % BAR_REFRESH_POLLS == 0:
-            threading.Thread(target=self._battery_worker,
-                             args=("bar",), daemon=True).start()
+            self._spawn_worker("bar")
 
-        # 维持 PS 键监听句柄
+        # 维持 PS 键监听句柄（后台线程执行 HID 打开，主线程绝不阻塞于系统调用）
+        if self.watch_dev is None or not self._watcher_alive():
+            self._spawn_watcher()
+
+    # ---------- 后台线程调度（限并发 + 事件去重） ----------
+    def _spawn_watcher(self):
+        """仅在没有重开任务进行中时启动监听句柄维护线程。"""
+        if self._watcher_busy:
+            return
+        threading.Thread(target=self.ensure_watcher, daemon=True).start()
+
+    def _spawn_worker(self, reason):
+        """启动一次 HID 读取线程；超过上限则跳过本次。
+
+        屏幕共享/语音软件抢占设备时，每次读取都可能耗时数秒。若不加限制，
+        1 秒轮询会不断堆积线程，最终把进程拖垮（日志里出现的同秒多次弹窗
+        就是这个连锁反应的外在表现）。
+        """
+        with self._worker_lock:
+            if self._active_workers >= ACTIVE_WORKERS_MAX:
+                return
+            self._active_workers += 1
+        threading.Thread(target=self._worker_entry, args=(reason,),
+                         daemon=True).start()
+
+    def _worker_entry(self, reason):
         try:
-            self.ensure_watcher()
-        except Exception:
-            log("ensure_watcher 异常:\n" + traceback.format_exc())
+            self._battery_worker(reason)
+        finally:
+            with self._worker_lock:
+                self._active_workers = max(0, self._active_workers - 1)
+
+    def _queue(self, payload):
+        """入队主线程动作，并对同类事件做时间窗去重。
+
+        防触发风暴：PS 键抖动 / 设备反复重枚举时，同一类提示在
+        BURST_WINDOW_SEC 内只响应一次，避免"同一秒弹出 5 个电量窗"。
+        """
+        kind = payload.get("kind", "")
+        if kind in ("battery", "toggle_bar"):
+            now = time.monotonic()
+            last = self._last_queued.get(kind, 0.0)
+            if now - last < BURST_WINDOW_SEC:
+                return False
+            self._last_queued[kind] = now
+        self.result_q.put(payload)
+        return True
 
     def _dispatch(self, payload):
         if payload.get("kind") == "toggle_bar":
@@ -935,6 +1206,12 @@ class BatteryOverlay:
         if payload.get("kind") == "disconnect":
             self.show_disconnect()
             self.update_bar(None, connected=False)
+            return
+        if payload.get("kind") == "power_plug":
+            self.show_power(True)
+            return
+        if payload.get("kind") == "power_unplug":
+            self.show_power(False)
             return
         pct = payload.get("pct")
         reason = payload.get("reason", "plug")
