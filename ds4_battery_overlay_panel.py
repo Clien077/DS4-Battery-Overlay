@@ -23,7 +23,7 @@ if BASE not in sys.path:
 import ds4_manager as mgr  # noqa: E402
 
 # ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
-__version__ = "1.2.1"
+__version__ = "1.2.5"
 APP_NAME = "DS4 电量提示"
 
 EXE = mgr.SCRIPT_EXE
@@ -136,9 +136,14 @@ class Panel(tk.Tk):
         self._btn(btns, "预览外观", CARD, self.preview, fg=FG).grid(
             row=1, column=2, sticky="ew", padx=(5, 0), pady=(8, 0))
 
+        self._btn(btns, "电池详情", CARD, self.show_battery_info,
+                  fg=FG).grid(row=2, column=0, columnspan=3, sticky="ew",
+                              pady=(8, 0))
+
         self.msg = tk.Label(self, text="提示：右键点击弹出的电量窗可退出常驻程序",
                             bg=BG, fg=SUB, font=("Microsoft YaHei UI", 9),
                             wraplength=380, justify="left")
+        self.msg.pack(anchor="w", pady=(12, 14), **pad)
         self.msg.pack(anchor="w", pady=(12, 14), **pad)
 
     def _btn(self, parent, text, color, cmd, fg=None):
@@ -166,6 +171,45 @@ class Panel(tk.Tk):
             fg=GREEN if on else SUB)
         # 按钮文案表示"点击后要做的事"：已开启 → 点击可关闭
         self.auto_btn.configure(text="关闭开机自启" if on else "开启开机自启")
+
+    def show_battery_info(self):
+        """电池详情：读取常驻程序写下的最新实测数据。
+
+        DS4 不提供 mAh 容量/健康度（硬件只按 10% 一档上报），
+        所以这里展示可实测的真实值，并给出基于标称容量的容量估算。
+        """
+        import json
+        path = os.path.join(mgr.BASE, "ds4_battery_info.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+        except Exception:
+            self._note("暂无电池数据：请先启动常驻程序并连接手柄"
+                       "（数据文件：ds4_battery_info.json）", YELLOW)
+            return
+        pct = d.get("pct")
+        if pct is None:
+            self._note("手柄已连接但未读到电量：可能被其它软件独占，"
+                       "或刚连接尚未出数", YELLOW)
+            return
+        if d.get("full"):
+            state = "已充满"
+        elif d.get("charging"):
+            state = "充电中"
+        else:
+            state = "放电中（无线）"
+        conn = "USB 有线" if d.get("cable") else "蓝牙无线"
+        self._note(
+            "电池详情（实测）\n"
+            "  真实电量  ：%d%%   （容量估算 %.0f mAh / 标称 %d mAh）\n"
+            "  原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限\n"
+            "  充电状态  ：%s\n"
+            "  连接方式  ：%s\n"
+            "  数据时间  ：%s"
+            % (int(pct), d.get("capacity_mah") or 0, d.get("nominal_mah") or 1000,
+               d.get("raw_level") if d.get("raw_level") is not None else "—",
+               state, conn, d.get("updated") or "—"),
+            GREEN)
 
     def _note(self, text, color=SUB):
         self.msg.configure(text=text, fg=color)

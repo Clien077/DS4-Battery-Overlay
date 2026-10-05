@@ -70,6 +70,7 @@ FADE_IN_MS = 150                       # 淡入总时长（毫秒；与淡出合
 FADE_OUT_MS = 350                      # 淡出总时长（毫秒；与淡入合计 0.5 秒）
 POLL_MS = 1000                         # 手柄接入检测轮询间隔（毫秒）
 READ_TIMEOUT = 2.0                     # 读取电量超时（秒）
+QUICK_TIMEOUT = 1.2                    # 横条刷新等"要跟手"的场景用更短等待（秒）
 
 # ---- 与屏幕共享/语音开黑软件（黑盒语音、Sunshine、OBS 等）共存相关的参数 ----
 # 这类软件会同时枚举/占用 DS4 的 HID 接口，导致：
@@ -93,7 +94,7 @@ BURST_WINDOW_SEC = 1.5                 # 同一类提示在此时长内只响应
 # 顶部电量横条（组合键：十字键下 + PS 切换显示）
 BAR_W = 450                            # 横条宽度
 BAR_H = 40                             # 横条高度：圆角胶囊外框 + 左上标签 + 8px 进度条
-BAR_REFRESH_POLLS = 5                  # 横条显示时每 5 秒自动刷新一次
+BAR_REFRESH_POLLS = 2                  # 横条显示时每 2 秒刷新一次（更跟手）
 BAR_TOP_MARGIN = 8                     # 距屏幕顶部
 BAR_RADIUS = 19                        # 横条左右两端圆角半径（约等于高度的一半）
 BAR_PAD = 1                            # 横条外轮廓与窗口边缘的留白
@@ -119,7 +120,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.1"
+__version__ = "1.2.5"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -139,6 +140,7 @@ LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 # 的电量字节会跳到 11 档（充电电压满刻度），无法读出真实电量，
 # 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
 STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
+NOMINAL_MAH = 1000                     # DS4 标称电池容量（mAh），用于换算容量估算
 _last_wireless_pct = None
 _last_save_ts = 0.0       # 状态文件写入限频时间戳
 _last_saved_pct = None    # 状态文件已保存值（去重）
@@ -174,6 +176,29 @@ def _save_state():
             json.dump({"wireless_pct": _last_wireless_pct}, f)
         _last_save_ts = time.time()
         _last_saved_pct = _last_wireless_pct
+    except Exception:
+        pass
+
+
+INFO_FILE = os.path.join(BASE_DIR, "ds4_battery_info.json")
+
+
+def _write_info(info):
+    """把最近一次电池详情落盘，供控制面板"电池详情"读取。
+
+    DS4 硬件只按 10% 一档上报百分比，也不提供 mAh 容量/健康度，
+    因此这里只记录可实测的真实数据（含原始档位，便于看出量化精度）。
+    """
+    try:
+        import json
+        payload = dict(info)
+        payload["raw_level"] = info.get("level")
+        payload["nominal_mah"] = NOMINAL_MAH
+        payload["capacity_mah"] = round(
+            NOMINAL_MAH * (info.get("pct") or 0) / 100.0, 1)
+        payload["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        with open(INFO_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
     except Exception:
         pass
 
@@ -394,7 +419,7 @@ def decode_status(status, is_bt=False):
             pct = (level + 1) * 10
         pct = min(100, pct)
         full = cable and pct >= 100
-        return {"pct": pct, "cable": cable,
+        return {"pct": pct, "cable": cable, "level": level,
                 "charging": charging, "full": full}
     if cable:
         if level <= 10:
@@ -409,7 +434,7 @@ def decode_status(status, is_bt=False):
         else:
             pct = (level + 1) * 10
             charging, full = False, False
-    return {"pct": max(0, min(100, pct)), "cable": cable,
+    return {"pct": max(0, min(100, pct)), "cable": cable, "level": level,
             "charging": charging, "full": full}
 
 
@@ -611,7 +636,7 @@ def read_battery_from_device(dev):
         if opened:
             if is_bt_device(dev):
                 activate_bt_full_report(dev)
-            got.wait(timeout=READ_TIMEOUT)
+            got.wait(timeout=QUICK_TIMEOUT if quick else READ_TIMEOUT)
     except Exception:
         pass
     finally:
@@ -623,16 +648,20 @@ def read_battery_from_device(dev):
     return result.get("pct")
 
 
-def read_ds4_status():
-    """读取第一个可用 DS4 的电量状态（含充电/充满标志）；失败返回 None。"""
+def read_ds4_status(quick=False):
+    """读取第一个可用 DS4 的电量状态（含充电/充满标志）；失败返回 None。
+
+    quick=True 时只等 QUICK_TIMEOUT（横条刷新等"要跟手"的场景用），
+    接入弹窗仍用完整 READ_TIMEOUT，避免误显示 --%。
+    """
     for dev in find_ds4_devices():
-        info = read_status_from_device(dev)
+        info = read_status_from_device(dev, quick=quick)
         if info is not None:
             return info
     return None
 
 
-def read_status_from_device(dev):
+def read_status_from_device(dev, quick=False):
     """打开设备读取首帧输入报告并解析电量状态。"""
     result = {}
     got = threading.Event()
@@ -657,6 +686,7 @@ def read_status_from_device(dev):
             if not (raw & 0x10) or (raw & 0x0F) <= 10:
                 _remember_wireless(info["pct"])
             result["info"] = info
+            _write_info(info)
             got.set()
         except Exception:
             pass
@@ -668,7 +698,7 @@ def read_status_from_device(dev):
         if opened:
             if is_bt_device(dev):
                 activate_bt_full_report(dev)
-            got.wait(timeout=READ_TIMEOUT)
+            got.wait(timeout=QUICK_TIMEOUT if quick else READ_TIMEOUT)
     except Exception:
         pass
     finally:
@@ -768,7 +798,7 @@ class BatteryOverlay:
         # 常驻读取线程：所有 HID 读取都排在它上面串行执行，线程数恒定
         threading.Thread(target=self._worker_thread, daemon=True).start()
 
-        self.root.after(300, self.poll_loop)
+        self.root.after(50, self.poll_loop)   # 尽快跑首轮：接入弹窗更快出现
 
     # ---------- 绘制 ----------
     def draw_battery(self, percent, charging=False, full=False):
@@ -1134,7 +1164,7 @@ class BatteryOverlay:
 
     def _battery_worker(self, reason="plug"):
         try:
-            info = read_ds4_status()
+            info = read_ds4_status(quick=(reason == "bar"))
             if info is None:
                 log(f"电量读取失败(reason={reason}) -> 弹窗显示 --%")
                 self._queue({"kind": "battery", "pct": None,
