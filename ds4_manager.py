@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DS4 电量提示 · 快捷管理
 ======================
@@ -18,7 +18,7 @@ import sys
 import time
 
 # ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 APP_NAME = "DS4 电量提示"
 
 # 程序目录：打包(exe)后用 exe 所在目录，开发(.py)后用脚本所在目录
@@ -49,20 +49,33 @@ def pythonw_exe():
 
 
 def find_pids():
-    """按命令行精确匹配常驻程序进程，排除查询进程自身。"""
+    """精确匹配常驻程序进程。
+
+    只认"进程名是 ds4_battery_overlay(.exe)"，或"进程名是 python* 且命令行
+    以本程序脚本结尾"这两种情况。
+
+    旧实现只判断"命令行里包含 ds4_battery_overlay 字符串"，会把
+    PowerShell 包装进程、导入本模块的调试脚本、甚至自身都算成实例
+    （实测曾把 1 个实例误报为 4 个），进而导致状态显示错误、
+    "停止"可能误伤无关进程。
+    """
+    # 单引号包裹脚本、双引号包裹脚本：两种形式都要能识别，且不能匹配到别的脚本名
     ps_cmd = (
-        "Get-CimInstance Win32_Process | "
-        "Where-Object { $_.CommandLine -like '*%s*' -and "
-        "$_.ProcessId -ne $PID } | "
-        "Select-Object -ExpandProperty ProcessId" % MATCH
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$n = $_.Name; $c = $_.CommandLine; "
+        "if (-not $c) { $false } "
+        "elseif ($n -match '^(?i)ds4_battery_overlay(\\.exe)?$') { $true } "
+        "elseif ($n -match '^(?i)pythonw?(\\.exe)?$') { "
+        "$c -match 'ds4_battery_overlay\\.py[\"''\\s]*$' } "
+        "else { $false } "
+        "} | Select-Object -ExpandProperty ProcessId"
     )
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=30)
-        pids = [int(line.strip()) for line in out.stdout.splitlines()
+        return [int(line.strip()) for line in out.stdout.splitlines()
                 if line.strip().isdigit()]
-        return pids
     except Exception:
         return []
 
