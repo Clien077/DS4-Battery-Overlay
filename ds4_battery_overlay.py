@@ -65,6 +65,10 @@ HOLD_LOW_SECONDS = 3.0                 # 低电量提示保持时间（秒）
 HOLD_DISCONNECT_SECONDS = 2.5          # 拔出提示保持时间（秒）
 HOLD_POWER_SECONDS = 1.5              # 接入/拔出电源提示保持时间（秒）
 LOW_BATTERY_PCT = 20                   # 低电量阈值（%）
+# ---- 防过充 ----
+# 物理前提：手柄插上 USB 后充电由硬件直连，软件无法切断充电电路，
+# 因此"防过充"实现为：带电达到阈值时主动提醒拔线（可关闭 / 可改阈值）。
+OVERCHARGE_DEFAULT_PCT = 90            # 达到该电量即提醒拔线（%）
 LOW_CHECK_INTERVAL_POLLS = 30          # 低电量周期检查（每 30 次轮询 ≈ 30 秒）
 FADE_IN_MS = 150                       # 淡入总时长（毫秒；与淡出合计 0.5 秒）
 FADE_OUT_MS = 350                      # 淡出总时长（毫秒；与淡入合计 0.5 秒）
@@ -120,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -140,6 +144,7 @@ LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 # 的电量字节会跳到 11 档（充电电压满刻度），无法读出真实电量，
 # 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
 STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
+CONFIG_FILE = os.path.join(BASE_DIR, "ds4_config.json")   # 防过充等设置
 NOMINAL_MAH = 1000                     # DS4 标称电池容量（mAh），用于换算容量估算
 _last_wireless_pct = None
 _last_save_ts = 0.0       # 状态文件写入限频时间戳
@@ -181,6 +186,37 @@ def _save_state():
 
 
 INFO_FILE = os.path.join(BASE_DIR, "ds4_battery_info.json")
+
+
+def _save_config(cfg):
+    try:
+        import json
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
+def _load_config():
+    """读取配置（目前只有防过充）。文件不存在时用默认值并落盘。"""
+    import json
+    cfg = {"overcharge_enabled": True, "overcharge_pct": OVERCHARGE_DEFAULT_PCT}
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            cfg.update(json.load(f) or {})
+    except Exception:
+        try:
+            _save_config(cfg)     # 首启用默认值生成文件，便于面板读写
+        except Exception:
+            pass
+    return cfg
+
+
+# 启动时载入一次；改配置需重启常驻程序生效（面板会提示）
+_cfg = _load_config()
+OVERCHARGE_ENABLED = bool(_cfg.get("overcharge_enabled", True))
+OVERCHARGE_PCT = int(_cfg.get("overcharge_pct") or OVERCHARGE_DEFAULT_PCT)
 
 
 def _write_info(info):
@@ -420,7 +456,8 @@ def decode_status(status, is_bt=False):
         pct = min(100, pct)
         full = cable and pct >= 100
         return {"pct": pct, "cable": cable, "level": level,
-                "charging": charging, "full": full}
+                "charging": charging, "full": full,
+                "overcharge": bool(cable and pct >= OVERCHARGE_PCT)}
     if cable:
         if level <= 10:
             pct, charging, full = level * 10, True, False
@@ -434,8 +471,10 @@ def decode_status(status, is_bt=False):
         else:
             pct = (level + 1) * 10
             charging, full = False, False
-    return {"pct": max(0, min(100, pct)), "cable": cable, "level": level,
-            "charging": charging, "full": full}
+    pct = max(0, min(100, pct))
+    return {"pct": pct, "cable": cable, "level": level,
+            "charging": charging, "full": full,
+            "overcharge": bool(cable and charging and pct >= OVERCHARGE_PCT)}
 
 
 def decode_battery(status, is_bt=False):
@@ -759,6 +798,8 @@ class BatteryOverlay:
         self.bar_visible = False # 电量横条是否显示
         self.bar_last_key = None # 横条上次绘制内容（去重）
         self.low_warned = False  # 本轮低电量是否已提示过（用于周期检查去重）
+        self.overcharge_warned = False   # 本轮是否已提示过防过充（电量回落后重置）
+        self._overcharge_cooldown = 0.0  # 防过充提示冷却截止时间（单调时钟）
         self.poll_count = 0      # 低电量周期检查计数器
         self._last_lowcheck = None  # 上次例行检查的(电量,充电,充满)，用于去重日志
         self.ps_cooldown_until = 0.0  # PS 双击/组合键触发冷却（防误触发风暴）
@@ -1120,6 +1161,41 @@ class BatteryOverlay:
         self.draw_message("手柄已断开", "DS4")
         log("弹出断开提示窗")
         self._present(HOLD_DISCONNECT_SECONDS)
+
+    def show_overcharge(self, pct):
+        """防过充提醒：插着线且电量已达阈值（软件无法断电，只能提醒拔线）。"""
+        self.draw_message("请拔掉充电线", "电量 %s%% · 防过充（已达 %d%%）"
+                          % (pct if pct is not None else "—", OVERCHARGE_PCT))
+        log("防过充提醒: 电量 %s%% 已达阈值 %d%%，提示拔线（软件无法切断充电）"
+            % (pct, OVERCHARGE_PCT))
+        self._present(HOLD_LOW_SECONDS)
+
+    def check_overcharge(self, info):
+        """按实测状态判断是否需要防过充提醒（带去重与冷却，避免反复打扰）。
+
+        info 为 read_ds4_status() 的结果（含 pct/cable/charging/overcharge）。
+        """
+        if not OVERCHARGE_ENABLED or not info:
+            return False
+        pct = info.get("pct")
+        trig = info.get("overcharge")
+        if trig is None:
+            cable = info.get("cable")
+            charging = info.get("charging")
+            trig = bool(cable and charging and pct is not None
+                        and pct >= OVERCHARGE_PCT)
+        now = time.monotonic()
+        if not trig:
+            # 电量回落到阈值以下（或已拔线）→ 允许下次再提醒
+            if pct is not None and pct < OVERCHARGE_PCT:
+                self.overcharge_warned = False
+            return False
+        if self.overcharge_warned or now < self._overcharge_cooldown:
+            return False
+        self.overcharge_warned = True
+        self._overcharge_cooldown = now + 60.0
+        self.show_overcharge(pct)
+        return True
 
     def show_power(self, plugged):
         """蓝牙连接时接入/拔出电源提示（约 1.5 秒）。"""
@@ -1616,6 +1692,8 @@ class BatteryOverlay:
                                   payload.get("full", False))
             elif pct > LOW_BATTERY_PCT:
                 self.low_warned = False
+            # 防过充：插着线且已达阈值 → 提醒拔线（本轮只提醒一次）
+            self.check_overcharge(payload)
         else:
             if pct is not None and pct <= LOW_BATTERY_PCT:
                 self.low_warned = True
@@ -1623,6 +1701,8 @@ class BatteryOverlay:
             hold = HOLD_PS_SECONDS if reason == "ps" else None
             self.show_battery(pct, payload.get("charging", False),
                               payload.get("full", False), hold=hold)
+            # 防过充：接入/手动查看时同样检查（复用同一帧数据，不再读设备）
+            self.check_overcharge(payload)
         # 顺带刷新横条（接入/PS 读取的同一帧数据）
         self.update_bar(pct, payload.get("charging", False),
                         payload.get("full", False))

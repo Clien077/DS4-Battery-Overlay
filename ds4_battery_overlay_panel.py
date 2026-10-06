@@ -23,7 +23,7 @@ if BASE not in sys.path:
 import ds4_manager as mgr  # noqa: E402
 
 # ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
-__version__ = "1.2.5"
+__version__ = "1.2.6"
 APP_NAME = "DS4 电量提示"
 
 EXE = mgr.SCRIPT_EXE
@@ -136,9 +136,12 @@ class Panel(tk.Tk):
         self._btn(btns, "预览外观", CARD, self.preview, fg=FG).grid(
             row=1, column=2, sticky="ew", padx=(5, 0), pady=(8, 0))
 
+        self.over_btn = self._btn(btns, "防过充：开", CARD, self.toggle_overcharge,
+                                  fg=FG)
+        self.over_btn.grid(row=2, column=0, columnspan=2, sticky="ew",
+                           padx=(0, 5), pady=(8, 0))
         self._btn(btns, "电池详情", CARD, self.show_battery_info,
-                  fg=FG).grid(row=2, column=0, columnspan=3, sticky="ew",
-                              pady=(8, 0))
+                  fg=FG).grid(row=2, column=2, sticky="ew", pady=(8, 0))
 
         self.msg = tk.Label(self, text="提示：右键点击弹出的电量窗可退出常驻程序",
                             bg=BG, fg=SUB, font=("Microsoft YaHei UI", 9),
@@ -171,6 +174,46 @@ class Panel(tk.Tk):
             fg=GREEN if on else SUB)
         # 按钮文案表示"点击后要做的事"：已开启 → 点击可关闭
         self.auto_btn.configure(text="关闭开机自启" if on else "开启开机自启")
+
+        # 防过充状态（阈值与开关存在 ds4_config.json）
+        cfg = self._read_config()
+        oc_on = bool(cfg.get("overcharge_enabled", True))
+        self.over_btn.configure(text=("关闭防过充" if oc_on else "开启防过充")
+                                + "(%d%%)" % int(cfg.get("overcharge_pct") or 90))
+
+    # ---------- 配置（防过充） ----------
+    @staticmethod
+    def _config_path():
+        return os.path.join(mgr.BASE, "ds4_config.json")
+
+    def _read_config(self):
+        import json
+        try:
+            with open(self._config_path(), "r", encoding="utf-8") as f:
+                d = json.load(f) or {}
+        except Exception:
+            d = {}
+        d.setdefault("overcharge_enabled", True)
+        d.setdefault("overcharge_pct", 90)
+        return d
+
+    def toggle_overcharge(self):
+        import json
+        cfg = self._read_config()
+        cfg["overcharge_enabled"] = not bool(cfg.get("overcharge_enabled", True))
+        try:
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self._note("写入配置失败：%s" % e, RED)
+            return
+        self.refresh()
+        if cfg["overcharge_enabled"]:
+            self._note("防过充已开启：插着线且电量达到 %d%% 时弹窗提醒拔线\n"
+                       "（软件无法切断充电电路，只能提醒）"
+                       % int(cfg["overcharge_pct"]), GREEN)
+        else:
+            self._note("防过充已关闭", YELLOW)
 
     def show_battery_info(self):
         """电池详情：读取常驻程序写下的最新实测数据。
