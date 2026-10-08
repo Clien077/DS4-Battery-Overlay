@@ -124,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.6"
+__version__ = "1.2.7"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -199,7 +199,7 @@ def _save_config(cfg):
 
 
 def _load_config():
-    """读取配置（目前只有防过充）。文件不存在时用默认值并落盘。"""
+    """读取配置（防过充开关/阈值等）。文件不存在时用默认值并落盘。"""
     import json
     cfg = {"overcharge_enabled": True, "overcharge_pct": OVERCHARGE_DEFAULT_PCT}
     try:
@@ -219,6 +219,108 @@ OVERCHARGE_ENABLED = bool(_cfg.get("overcharge_enabled", True))
 OVERCHARGE_PCT = int(_cfg.get("overcharge_pct") or OVERCHARGE_DEFAULT_PCT)
 
 
+def _fmt_minutes(minutes):
+    """把分钟数格式化为"约 X 小时 Y 分钟"。"""
+    if minutes is None:
+        return None
+    m = int(round(minutes))
+    if m < 1:
+        return "不到 1 分钟"
+    if m < 60:
+        return "约 %d 分钟" % m
+    return "约 %d 小时 %d 分钟" % (m // 60, m % 60)
+
+
+class UsageEstimator:
+    """按历史读数估算「还能用多久」与「还要充多久」。
+
+    现实约束（必须诚实处理）：
+      · DS4 只按 **10% 一档**上报电量，单次跳变就是 10 个百分点；
+      · 因此速率只有在累计跨过至少一档（≥10%）之后才有意义，
+        否则会把测量噪声放大成荒谬的估计；
+      · 数据不足时返回 None，界面显示"估算中"，绝不编造数字。
+    """
+
+    MIN_SPAN_MIN = 2.0      # 两个样本至少间隔 2 分钟
+    MIN_DELTA_PCT = 9       # 至少变化 9 个百分点（覆盖 1 档量化步长）
+    MAX_AGE_MIN = 180.0     # 只保留最近 3 小时的样本
+
+    def __init__(self):
+        self.discharge = []   # [(time, pct)] 放电样本
+        self.charge = []      # [(time, pct)] 充电样本
+
+    @staticmethod
+    def _pair(samples):
+        if len(samples) < 2:
+            return None
+        (t0, p0), (t1, p1) = samples[0], samples[-1]
+        span = (t1 - t0) / 60.0
+        if span < UsageEstimator.MIN_SPAN_MIN:
+            return None
+        if abs(p1 - p0) >= UsageEstimator.MIN_DELTA_PCT:
+            return (p0, t0), (p1, t1), span
+        return None
+
+    def _trend(self, samples, rising):
+        """返回 (当前pct, 每分钟变化率)；数据不足返回 None。"""
+        pair = self._pair(samples)
+        if pair is None:
+            return None
+        (p0, _t0), (p1, _t1), span = pair
+        rate = (p1 - p0) / span
+        if rising and rate <= 0.2:
+            return None
+        if (not rising) and rate >= -0.2:
+            return None
+        return p1, rate
+
+    def update(self, pct, charging, cable):
+        """喂入一次读数；返回本次是否产生了有意义的变化。"""
+        if pct is None:
+            return False
+        now = time.time()
+        bucket = self.charge if (charging or cable) else self.discharge
+        other = self.discharge if bucket is self.charge else self.charge
+        # 只在档位变化时记录，避免同一档内反复刷样本
+        if not bucket or bucket[-1][1] != pct:
+            bucket.append((now, pct))
+        cutoff = now - self.MAX_AGE_MIN * 60
+        for lst in (bucket, other):
+            while len(lst) > 1 and lst[0][0] < cutoff:
+                lst.pop(0)
+        return True
+
+    def remaining_text(self):
+        """还能用多久（放电趋势）。"""
+        tr = self._trend(self.discharge, rising=False)
+        if tr is None:
+            return None
+        pct, rate = tr
+        if pct <= 0:
+            return None
+        return _fmt_minutes(pct / abs(rate))
+
+    def full_text(self, current_pct):
+        """还要多久充满（充电趋势）。"""
+        tr = self._trend(self.charge, rising=True)
+        if tr is None:
+            return None
+        pct, rate = tr
+        if pct >= 100:
+            return "已充满"
+        return _fmt_minutes((100 - pct) / rate)
+
+    def note(self):
+        """数据是否足够的简短说明（给界面用）。"""
+        if self._trend(self.discharge, rising=False) is None and \
+                self._trend(self.charge, rising=True) is None:
+            return "估算中（需累计变化 ≥10% 才有意义）"
+        return None
+
+
+_estimator = UsageEstimator()
+
+
 def _write_info(info):
     """把最近一次电池详情落盘，供控制面板"电池详情"读取。
 
@@ -232,6 +334,12 @@ def _write_info(info):
         payload["nominal_mah"] = NOMINAL_MAH
         payload["capacity_mah"] = round(
             NOMINAL_MAH * (info.get("pct") or 0) / 100.0, 1)
+        # 时长估算：喂样本后取结果（数据不足时为 None，界面显示"估算中"）
+        _estimator.update(info.get("pct"), bool(info.get("charging")),
+                          bool(info.get("cable")))
+        payload["est_remaining"] = _estimator.remaining_text()
+        payload["est_full"] = _estimator.full_text(info.get("pct"))
+        payload["est_note"] = _estimator.note()
         payload["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(INFO_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)

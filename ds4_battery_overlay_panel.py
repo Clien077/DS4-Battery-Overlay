@@ -2,10 +2,10 @@
 """
 DS4 电量提示 · 可视化控制面板
 ==============================
-一个窗口按钮化操作常驻程序：启动 / 停止 / 重启 / 查看状态 / 开机自启 / 预览界面。
+一个窗口按钮化操作常驻程序：启动 / 停止 / 重启 / 查看状态 / 开机自启 /
+防过充开关 / 电池详情（含续航与充满时长估算）/ 预览界面。
 
-与 ds4_manager.py 的区别：ds4_manager 是命令行菜单（.bat 里选数字），
-本面板是纯图形界面，双击即可操作。
+本面板**自包含**：启停与进程识别都在本文件内实现，不再依赖 ds4_manager。
 
 运行：python ds4_battery_overlay_panel.py
 打包后可放在 ds4_battery_overlay.exe 同目录使用。
@@ -13,20 +13,19 @@ DS4 电量提示 · 可视化控制面板
 import os
 import subprocess
 import sys
+import time
 import tkinter as tk
 
-# 让本脚本无论放在哪都能 import 到同目录的 ds4_manager
-BASE = os.path.dirname(os.path.abspath(__file__))
-if BASE not in sys.path:
-    sys.path.insert(0, BASE)
+# 面板自身所在目录（打包 exe 后为本 exe 所在目录）
+BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+    else os.path.dirname(os.path.abspath(__file__))
 
-import ds4_manager as mgr  # noqa: E402
-
-# ---- 版本号：与主程序保持一致（升级时同步修改三处同名常量）----
-__version__ = "1.2.6"
+# ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
+__version__ = "1.2.7"
 APP_NAME = "DS4 电量提示"
 
-EXE = mgr.SCRIPT_EXE
+OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
+OVERLAY_PY = os.path.join(BASE, "ds4_battery_overlay.py")
 AUTOSTART_NAME = "DS4BatteryOverlay"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
@@ -42,8 +41,40 @@ BLUE = "#4C8DFF"
 
 def target_cmd(extra=None):
     """返回要启动的命令行（打包 exe 优先，否则 pythonw + 脚本）。"""
-    cmd = mgr.target_command()
+    if os.path.exists(OVERLAY_EXE):
+        cmd = [OVERLAY_EXE]
+    else:
+        exe = sys.executable
+        if exe.lower().endswith("python.exe"):
+            exe = exe[:-len("python.exe")] + "pythonw.exe"
+        cmd = [exe, OVERLAY_PY]
     return cmd + list(extra or [])
+
+
+def find_overlay_pids():
+    """精确匹配常驻主程序进程（不依赖 ds4_manager）。
+
+    只认"进程名是 ds4_battery_overlay(.exe)"，或"进程名是 python(w).exe 且
+    命令行以本程序脚本全文结尾"。旧写法只判断命令行是否包含该字符串，
+    会把 PowerShell 包装进程、调试脚本、自身都算成实例（实测 1 个误报为 4 个）。
+    """
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$n = $_.Name; $c = $_.CommandLine; "
+        "if (-not $c) { $false } "
+        "elseif ($n -match '^(?i)ds4_battery_overlay(\\.exe)?$') { $true } "
+        "elseif ($n -match '^(?i)pythonw?(\\.exe)?$') { "
+        "$c -match 'ds4_battery_overlay\\.py[\"''\\s]*$' } "
+        "else { $false } "
+        "} | Select-Object -ExpandProperty ProcessId"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+            capture_output=True, text=True, timeout=30)
+        return [int(x.strip()) for x in out.stdout.splitlines() if x.strip().isdigit()]
+    except Exception:
+        return []
 
 
 def autostart_enabled():
@@ -61,8 +92,10 @@ def set_autostart(on):
     """开关开机自启，返回 (是否成功, 说明文字)。"""
     try:
         if on:
-            cmd = '"%s"' % (EXE if os.path.exists(EXE) else sys.executable)
-            subprocess.run([EXE if os.path.exists(EXE) else sys.executable,
+            cmd = '"%s"' % (OVERLAY_EXE if os.path.exists(OVERLAY_EXE)
+                            else sys.executable)
+            subprocess.run([OVERLAY_EXE if os.path.exists(OVERLAY_EXE)
+                            else sys.executable,
                             "--autostart"], capture_output=True, timeout=20)
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
@@ -70,7 +103,7 @@ def set_autostart(on):
                 winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
             return True, "已开启开机自启"
         else:
-            exe = EXE if os.path.exists(EXE) else sys.executable
+            exe = OVERLAY_EXE if os.path.exists(OVERLAY_EXE) else sys.executable
             subprocess.run([exe, "--no-autostart"], capture_output=True, timeout=20)
             import winreg
             try:
@@ -158,7 +191,7 @@ class Panel(tk.Tk):
 
     # ---------- 行为 ----------
     def refresh(self):
-        pids = mgr.find_pids()
+        pids = find_overlay_pids()
         if pids:
             self.dot.configure(fg=GREEN)
             self.state_lbl.configure(text="运行中")
@@ -184,7 +217,7 @@ class Panel(tk.Tk):
     # ---------- 配置（防过充） ----------
     @staticmethod
     def _config_path():
-        return os.path.join(mgr.BASE, "ds4_config.json")
+        return os.path.join(BASE, "ds4_config.json")
 
     def _read_config(self):
         import json
@@ -222,7 +255,7 @@ class Panel(tk.Tk):
         所以这里展示可实测的真实值，并给出基于标称容量的容量估算。
         """
         import json
-        path = os.path.join(mgr.BASE, "ds4_battery_info.json")
+        path = os.path.join(BASE, "ds4_battery_info.json")
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -242,32 +275,62 @@ class Panel(tk.Tk):
         else:
             state = "放电中（无线）"
         conn = "USB 有线" if d.get("cable") else "蓝牙无线"
+        # 时长估算：放电看"还能用多久"，充电看"还要充多久"（数据不足显示估算中）
+        if d.get("full"):
+            est = "充电时长：已充满"
+        elif d.get("charging") or d.get("cable"):
+            est = "充电时长：还需 %s" % (d.get("est_full") or "估算中")
+        else:
+            est = "预计续航：还能用 %s" % (d.get("est_remaining") or "估算中")
+        note = d.get("est_note")
         self._note(
             "电池详情（实测）\n"
             "  真实电量  ：%d%%   （容量估算 %.0f mAh / 标称 %d mAh）\n"
             "  原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限\n"
             "  充电状态  ：%s\n"
             "  连接方式  ：%s\n"
-            "  数据时间  ：%s"
+            "  %s\n"
+            "  数据时间  ：%s%s"
             % (int(pct), d.get("capacity_mah") or 0, d.get("nominal_mah") or 1000,
                d.get("raw_level") if d.get("raw_level") is not None else "—",
-               state, conn, d.get("updated") or "—"),
+               state, conn, est, d.get("updated") or "—",
+               ("\n  ※ %s" % note) if note else ""),
             GREEN)
 
     def _note(self, text, color=SUB):
         self.msg.configure(text=text, fg=color)
 
+    # ---------- 启停控制（自包含，不依赖 ds4_manager） ----------
+    @staticmethod
+    def start_overlay():
+        """启动常驻程序（已在运行则由其单实例保护自行退出）。"""
+        if find_overlay_pids():
+            return False
+        subprocess.Popen(target_cmd(), close_fds=True)
+        return True
+
+    @staticmethod
+    def stop_overlay():
+        """停止常驻程序：只结束精确匹配到的实例。"""
+        pids = find_overlay_pids()
+        for pid in pids:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True)
+        return len(pids)
+
     def act(self, what):
         try:
             if what == "start":
-                mgr.do_start()
-                self._note("已发送启动指令", GREEN)
+                self.start_overlay()
+                self._note("已启动常驻程序", GREEN)
             elif what == "stop":
-                mgr.do_stop()
-                self._note("已发送停止指令", RED)
+                n = self.stop_overlay()
+                self._note("已停止 %d 个实例" % n if n else "程序本来就没在运行", RED)
             elif what == "restart":
-                mgr.do_restart()
-                self._note("已发送重启指令", BLUE)
+                self.stop_overlay()
+                time.sleep(1.2)
+                self.start_overlay()
+                self._note("已重启常驻程序", BLUE)
         except Exception as e:
             self._note("操作出错：%s" % e, RED)
         self.after(600, self.refresh)
