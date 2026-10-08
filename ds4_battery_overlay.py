@@ -124,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -241,9 +241,10 @@ class UsageEstimator:
       · 数据不足时返回 None，界面显示"估算中"，绝不编造数字。
     """
 
-    MIN_SPAN_MIN = 2.0      # 两个样本至少间隔 2 分钟
-    MIN_DELTA_PCT = 9       # 至少变化 9 个百分点（覆盖 1 档量化步长）
+    MIN_SPAN_MIN = 0.5      # 两个样本至少间隔 30 秒
+    MIN_DELTA_PCT = 8       # 至少变化 8 个百分点（约 1 档量化步长）
     MAX_AGE_MIN = 180.0     # 只保留最近 3 小时的样本
+    CACHE_MIN = 3           # 样本少于这么多时也允许估算（只要首尾差异够）
 
     def __init__(self):
         self.discharge = []   # [(time, pct)] 放电样本
@@ -290,15 +291,34 @@ class UsageEstimator:
                 lst.pop(0)
         return True
 
-    def remaining_text(self):
-        """还能用多久（放电趋势）。"""
+    def remaining_text(self, current_pct=None):
+        """还能用多久（放电趋势）。
+
+        插着线时放电样本不再更新，此时用**最近一次的放电速率**配合当前电量
+        继续给出估算（并标注为"按上次无线速率"），避免插线后就看不到续航。
+        """
         tr = self._trend(self.discharge, rising=False)
-        if tr is None:
+        self._used_cache = False
+        if tr is not None:
+            pct, rate = tr
+            self._last_rate = rate          # 记住速率供插线时复用
+            self._last_rate_ts = time.time()
+            base = current_pct if current_pct is not None else pct
+            if base and base > 0:
+                return _fmt_minutes(base / abs(rate))
             return None
-        pct, rate = tr
-        if pct <= 0:
+        # 没有新样本：用缓存的放电速率 + 当前电量推算
+        rate = getattr(self, "_last_rate", None)
+        if rate is None or current_pct is None or current_pct <= 0:
             return None
-        return _fmt_minutes(pct / abs(rate))
+        if time.time() - getattr(self, "_last_rate_ts", 0) > self.MAX_AGE_MIN * 60:
+            return None
+        self._used_cache = True
+        return _fmt_minutes(current_pct / abs(rate))
+
+    def remaining_is_cached(self):
+        """当前续航是否为"按上次无线速率推算"（插线状态）。"""
+        return getattr(self, "_used_cache", False)
 
     def full_text(self, current_pct):
         """还要多久充满（充电趋势）。"""
@@ -310,11 +330,10 @@ class UsageEstimator:
             return "已充满"
         return _fmt_minutes((100 - pct) / rate)
 
-    def note(self):
-        """数据是否足够的简短说明（给界面用）。"""
-        if self._trend(self.discharge, rising=False) is None and \
-                self._trend(self.charge, rising=True) is None:
-            return "估算中（需累计变化 ≥10% 才有意义）"
+    def note(self, remaining=None, full=None):
+        """给界面的简短说明：只有两个估算都拿不到时才提示需要累积数据。"""
+        if remaining is None and full is None:
+            return "估算中（手柄按 10% 一档上报，需累积到跨档才能算速率）"
         return None
 
 
@@ -334,12 +353,17 @@ def _write_info(info):
         payload["nominal_mah"] = NOMINAL_MAH
         payload["capacity_mah"] = round(
             NOMINAL_MAH * (info.get("pct") or 0) / 100.0, 1)
-        # 时长估算：喂样本后取结果（数据不足时为 None，界面显示"估算中"）
-        _estimator.update(info.get("pct"), bool(info.get("charging")),
+        # 时长估算：喂样本后取结果（数据不足时该字段为 None，界面显示"估算中"）
+        pct_now = info.get("pct")
+        _estimator.update(pct_now, bool(info.get("charging")),
                           bool(info.get("cable")))
-        payload["est_remaining"] = _estimator.remaining_text()
-        payload["est_full"] = _estimator.full_text(info.get("pct"))
-        payload["est_note"] = _estimator.note()
+        rem = _estimator.remaining_text(pct_now)
+        full = _estimator.full_text(pct_now)
+        payload["est_remaining"] = rem
+        payload["est_full"] = full
+        # 插线时续航是按上次无线速率推算的，界面据此加一句说明
+        payload["est_remaining_cached"] = bool(rem and _estimator.remaining_is_cached())
+        payload["est_note"] = _estimator.note(rem, full)
         payload["updated"] = time.strftime("%Y-%m-%d %H:%M:%S")
         with open(INFO_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)

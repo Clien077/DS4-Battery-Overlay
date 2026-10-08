@@ -21,7 +21,7 @@ BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
-__version__ = "1.2.7"
+__version__ = "1.2.8"
 APP_NAME = "DS4 电量提示"
 
 OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
@@ -275,13 +275,18 @@ class Panel(tk.Tk):
         else:
             state = "放电中（无线）"
         conn = "USB 有线" if d.get("cable") else "蓝牙无线"
-        # 时长估算：放电看"还能用多久"，充电看"还要充多久"（数据不足显示估算中）
+        # 两个时间都常显：续航（放电速率）+ 充满时长（充电速率）
+        rem = d.get("est_remaining")
+        full = d.get("est_full")
         if d.get("full"):
-            est = "充电时长：已充满"
-        elif d.get("charging") or d.get("cable"):
-            est = "充电时长：还需 %s" % (d.get("est_full") or "估算中")
-        else:
-            est = "预计续航：还能用 %s" % (d.get("est_remaining") or "估算中")
+            full = "已充满"
+        rem_line = "预计续航  ：%s" % (
+            ("还能用 %s" % rem) if rem else "估算中（跨过一档后自动出数）")
+        if d.get("est_remaining_cached") and rem:
+            rem_line += "   ← 按上次无线速率推算"
+        full_line = "预计充满  ：%s" % (
+            full if full == "已充满" else
+            (("还需 %s" % full) if full else "估算中（插线充电跨档后自动出数）"))
         note = d.get("est_note")
         self._note(
             "电池详情（实测）\n"
@@ -290,10 +295,11 @@ class Panel(tk.Tk):
             "  充电状态  ：%s\n"
             "  连接方式  ：%s\n"
             "  %s\n"
+            "  %s\n"
             "  数据时间  ：%s%s"
             % (int(pct), d.get("capacity_mah") or 0, d.get("nominal_mah") or 1000,
                d.get("raw_level") if d.get("raw_level") is not None else "—",
-               state, conn, est, d.get("updated") or "—",
+               state, conn, rem_line, full_line, d.get("updated") or "—",
                ("\n  ※ %s" % note) if note else ""),
             GREEN)
 
