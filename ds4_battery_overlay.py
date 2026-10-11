@@ -124,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -145,7 +145,6 @@ LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 # 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
 STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "ds4_config.json")   # 防过充等设置
-NOMINAL_MAH = 1000                     # DS4 标称电池容量（mAh），用于换算容量估算
 _last_wireless_pct = None
 _last_save_ts = 0.0       # 状态文件写入限频时间戳
 _last_saved_pct = None    # 状态文件已保存值（去重）
@@ -343,16 +342,14 @@ _estimator = UsageEstimator()
 def _write_info(info):
     """把最近一次电池详情落盘，供控制面板"电池详情"读取。
 
-    DS4 硬件只按 10% 一档上报百分比，也不提供 mAh 容量/健康度，
-    因此这里只记录可实测的真实数据（含原始档位，便于看出量化精度）。
+    DS4 硬件只按 10% 一档上报百分比，也不提供 mAh 容量/健康度；
+    因此这里只记录**可实测的真实数据**（电量、原始档位、充电状态、连接方式、时长估算），
+    不做任何容量换算。
     """
     try:
         import json
         payload = dict(info)
         payload["raw_level"] = info.get("level")
-        payload["nominal_mah"] = NOMINAL_MAH
-        payload["capacity_mah"] = round(
-            NOMINAL_MAH * (info.get("pct") or 0) / 100.0, 1)
         # 时长估算：喂样本后取结果（数据不足时该字段为 None，界面显示"估算中"）
         pct_now = info.get("pct")
         _estimator.update(pct_now, bool(info.get("charging")),

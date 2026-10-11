@@ -21,7 +21,7 @@ BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
-__version__ = "1.2.8"
+__version__ = "1.2.9"
 APP_NAME = "DS4 电量提示"
 
 OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
@@ -252,7 +252,8 @@ class Panel(tk.Tk):
         """电池详情：读取常驻程序写下的最新实测数据。
 
         DS4 不提供 mAh 容量/健康度（硬件只按 10% 一档上报），
-        所以这里展示可实测的真实值，并给出基于标称容量的容量估算。
+        因此这里只展示**可实测的真实值**（电量 / 原始档位 / 充电状态 / 连接方式 / 时长估算），
+        不做容量估算。
         """
         import json
         path = os.path.join(BASE, "ds4_battery_info.json")
@@ -290,14 +291,14 @@ class Panel(tk.Tk):
         note = d.get("est_note")
         self._note(
             "电池详情（实测）\n"
-            "  真实电量  ：%d%%   （容量估算 %.0f mAh / 标称 %d mAh）\n"
+            "  真实电量  ：%d%%\n"
             "  原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限\n"
             "  充电状态  ：%s\n"
             "  连接方式  ：%s\n"
             "  %s\n"
             "  %s\n"
             "  数据时间  ：%s%s"
-            % (int(pct), d.get("capacity_mah") or 0, d.get("nominal_mah") or 1000,
+            % (int(pct),
                d.get("raw_level") if d.get("raw_level") is not None else "—",
                state, conn, rem_line, full_line, d.get("updated") or "—",
                ("\n  ※ %s" % note) if note else ""),
