@@ -106,10 +106,16 @@ _gp_ico_path = None
 
 
 def _apply_gamepad_icon(win):
-    """把窗口左上角图标换成手柄样式（失败静默，不影响功能）。"""
+    """把窗口左上角与任务栏图标换成手柄样式。
+
+    Tk 的 iconbitmap() 只设置**窗口图标**（WM_GETICON），而任务栏按钮在部分
+    情况下显示的是**窗口类图标**（GCLP_HICON），因此这里两者都显式设置；
+    失败静默，不影响功能。
+    """
     global _gp_ico_path
     try:
         import base64 as _b64
+        import ctypes
         import os as _os
         import tempfile
         if _gp_ico_path is None:
@@ -119,9 +125,52 @@ def _apply_gamepad_icon(win):
             with open(_gp_ico_path, "wb") as f:
                 f.write(_b64.b64decode(_GAMEPAD_ICO_B64))
         win.iconbitmap(_gp_ico_path)
+        win.update_idletasks()
+        u32 = ctypes.windll.user32
+        u32.LoadImageW.restype = ctypes.c_void_p
+        u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                   ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+        u32.GetAncestor.restype = ctypes.c_void_p
+        IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x10, 0x40
+        ICON_BIG, ICON_SMALL = 1, 0
+        WM_SETICON = 0x0080
+        GCLP_HICON, GCLP_HICONSM = -14, -34
+        big = u32.LoadImageW(None, _gp_ico_path, IMAGE_ICON, 32, 32,
+                             LR_LOADFROMFILE)
+        small = u32.LoadImageW(None, _gp_ico_path, IMAGE_ICON, 16, 16,
+                               LR_LOADFROMFILE) or big
+        hwnd = u32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+        if big:
+            u32.SendMessageW(ctypes.c_void_p(hwnd), WM_SETICON, ICON_BIG,
+                             ctypes.c_void_p(big))
+        if small:
+            u32.SendMessageW(ctypes.c_void_p(hwnd), WM_SETICON, ICON_SMALL,
+                             ctypes.c_void_p(small))
+        # 同时设置窗口类图标：任务栏部分场景读的是它
+        if big:
+            u32.SetClassLongPtrW(ctypes.c_void_p(hwnd), GCLP_HICON,
+                                 ctypes.c_void_p(big))
+        if small:
+            u32.SetClassLongPtrW(ctypes.c_void_p(hwnd), GCLP_HICONSM,
+                                 ctypes.c_void_p(small))
+        _icon_log("ok hwnd=%s big=%s small=%s iconbitmap=%s"
+                  % (hwnd, big, small, _gp_ico_path))
         return True
-    except Exception:
+    except Exception as e:
+        _icon_log("fail %s: %s" % (type(e).__name__, e))
         return False
+
+
+def _icon_log(msg):
+    """图标设置诊断日志（写到程序目录，便于排查 frozen 下的问题）。"""
+    try:
+        import time as _t
+        with open(os.path.join(BASE, "ds4_panel_icon.log"), "a",
+                  encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (_t.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
 APP_NAME = "DS4 电量提示"
 
 OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
@@ -224,6 +273,9 @@ class Panel(tk.Tk):
         self.configure(bg=BG)
         self.resizable(False, False)
         _apply_gamepad_icon(self)          # 左上角图标 -> 手柄样式
+        # 窗口映射后 Tk 会重建部分窗口属性，此时再补打一次图标，
+        # 否则任务栏按钮会退回默认图标（实测 WM_GETICON 会变回 0）。
+        self.after(200, lambda: _apply_gamepad_icon(self))
         self._build()
         self.refresh()
 

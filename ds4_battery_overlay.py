@@ -209,10 +209,16 @@ _gp_ico_path = None
 
 
 def _apply_gamepad_icon(win):
-    """把窗口左上角图标换成手柄样式（失败静默，不影响功能）。"""
+    """把窗口左上角与任务栏图标换成手柄样式。
+
+    Tk 的 iconbitmap() 只设置**窗口图标**（WM_GETICON），而任务栏按钮在部分
+    情况下显示的是**窗口类图标**（GCLP_HICON），因此这里两者都显式设置；
+    失败静默，不影响功能。
+    """
     global _gp_ico_path
     try:
         import base64 as _b64
+        import ctypes
         import os as _os
         import tempfile
         if _gp_ico_path is None:
@@ -222,6 +228,57 @@ def _apply_gamepad_icon(win):
             with open(_gp_ico_path, "wb") as f:
                 f.write(_b64.b64decode(_GAMEPAD_ICO_B64))
         win.iconbitmap(_gp_ico_path)
+        win.update_idletasks()
+        u32 = ctypes.windll.user32
+        u32.LoadImageW.restype = ctypes.c_void_p
+        u32.LoadImageW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+                                   ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+        u32.GetAncestor.restype = ctypes.c_void_p
+        IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x10, 0x40
+        ICON_BIG, ICON_SMALL = 1, 0
+        WM_SETICON = 0x0080
+        GCLP_HICON, GCLP_HICONSM = -14, -34
+        big = u32.LoadImageW(None, _gp_ico_path, IMAGE_ICON, 32, 32,
+                             LR_LOADFROMFILE)
+        small = u32.LoadImageW(None, _gp_ico_path, IMAGE_ICON, 16, 16,
+                               LR_LOADFROMFILE) or big
+        hwnd = u32.GetAncestor(win.winfo_id(), 2) or win.winfo_id()
+        if big:
+            u32.SendMessageW(ctypes.c_void_p(hwnd), WM_SETICON, ICON_BIG,
+                             ctypes.c_void_p(big))
+        if small:
+            u32.SendMessageW(ctypes.c_void_p(hwnd), WM_SETICON, ICON_SMALL,
+                             ctypes.c_void_p(small))
+        # 同时设置窗口类图标：任务栏部分场景读的是它
+        if big:
+            u32.SetClassLongPtrW(ctypes.c_void_p(hwnd), GCLP_HICON,
+                                 ctypes.c_void_p(big))
+        if small:
+            u32.SetClassLongPtrW(ctypes.c_void_p(hwnd), GCLP_HICONSM,
+                                 ctypes.c_void_p(small))
+        return True
+    except Exception:
+        return False
+def _make_tool_window(win):
+    """把窗口标记为工具窗口（WS_EX_TOOLWINDOW），使其**不出现在任务栏**。
+
+    Tk 的 overrideredirect(True) 只去掉边框，并不设置该扩展样式；
+    而这类无边框窗口的 owner 为 None，Windows 会把它当作主窗口登记到任务栏，
+    于是屏幕底部的电量弹窗会在任务栏多出一个图标。
+    工具窗口样式是**永久性**的（窗口映射后修改无效），所以必须在显示前设置。
+    """
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)  # GA_ROOT
+        if not hwnd:
+            hwnd = win.winfo_id()
+        GWL_EXSTYLE = -20
+        WS_EX_TOOLWINDOW = 0x00000080
+        cur = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                            cur | WS_EX_TOOLWINDOW)
         return True
     except Exception:
         return False
@@ -1051,13 +1108,26 @@ class BatteryOverlay:
             "回调异常:\n" + "".join(traceback.format_exception(t, v, tb)))
         self.root.withdraw()
         self.root.overrideredirect(True)
-        _apply_gamepad_icon(self.root)      # 左上角图标 -> 手柄样式
+        # 隐藏的 owner 窗口：让弹窗/横条成为其附属窗口（不进任务栏的保险之一）
+        self.owner = tk.Tk()
+        self.owner.withdraw()
+        self.owner.overrideredirect(True)
+        try:
+            self.owner.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        self.owner.geometry("1x1+0+0")
         self.root.attributes("-topmost", True)
         try:
             self.root.attributes("-transparentcolor", MAGIC)
         except tk.TclError:
             pass
         self.root.attributes("-alpha", 0.0)
+        # 关键：工具窗口扩展样式必须放在**所有样式设置之后**再打。
+        # Tk 的 overrideredirect / attributes 会重设窗口样式，若先打会被覆盖，
+        # 于是弹窗仍被 Windows 当作主窗口登记到任务栏（用户看到的现象）。
+        _make_tool_window(self.root)
+        _make_tool_window(self.owner)
 
         sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         x = (sw - W) // 2
@@ -1206,7 +1276,12 @@ class BatteryOverlay:
             return
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
+        _make_tool_window(win)              # 工具窗口：不进任务栏
         _apply_gamepad_icon(win)            # 左上角图标 -> 手柄样式
+        try:
+            win.transient(self.owner)       # 附属窗口：双保险不进任务栏
+        except tk.TclError:
+            pass
         win.attributes("-topmost", True)
         try:
             win.attributes("-transparentcolor", MAGIC)
@@ -1433,6 +1508,12 @@ class BatteryOverlay:
             self.root.deiconify()
             self.root.attributes("-topmost", True)   # 始终保持最前
             self.root.lift()
+            # 窗口映射后再补打一次图标（映射会覆盖之前设置的窗口样式），
+            # 之后再补一次工具窗口样式，确保不会出现在任务栏。
+            if not getattr(self, "_icon_applied", False):
+                _apply_gamepad_icon(self.root)
+                self._icon_applied = True
+            _make_tool_window(self.root)
             self._set_alpha(0.0)
             step = FADE_IN_MS / 10
             cur = [0.0]
