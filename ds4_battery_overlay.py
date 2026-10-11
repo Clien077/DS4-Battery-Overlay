@@ -124,7 +124,107 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.11"
+__version__ = "1.2.10"
+
+
+# ---- 手柄图标（base64 内嵌，避免依赖外部文件；打包后同样可用）----
+_GAMEPAD_ICO_B64 = (
+    "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"
+    "tu1ntyJXTgAAAABJRU5ErkJggg=="
+)
+
+_gp_ico_path = None
+
+
+def _apply_gamepad_icon(win):
+    """把窗口左上角图标换成手柄样式（失败静默，不影响功能）。"""
+    global _gp_ico_path
+    try:
+        import base64 as _b64
+        import os as _os
+        import tempfile
+        if _gp_ico_path is None:
+            d = _os.path.join(tempfile.gettempdir(), "ds4_battery_overlay")
+            _os.makedirs(d, exist_ok=True)
+            _gp_ico_path = _os.path.join(d, "ds4_gamepad.ico")
+            with open(_gp_ico_path, "wb") as f:
+                f.write(_b64.b64decode(_GAMEPAD_ICO_B64))
+        win.iconbitmap(_gp_ico_path)
+        return True
+    except Exception:
+        return False
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -951,6 +1051,7 @@ class BatteryOverlay:
             "回调异常:\n" + "".join(traceback.format_exception(t, v, tb)))
         self.root.withdraw()
         self.root.overrideredirect(True)
+        _apply_gamepad_icon(self.root)      # 左上角图标 -> 手柄样式
         self.root.attributes("-topmost", True)
         try:
             self.root.attributes("-transparentcolor", MAGIC)
@@ -1060,9 +1161,16 @@ class BatteryOverlay:
             fill = BAT_MID
         else:
             fill = BAT_GOOD
-        fw = int((bw - 6) * (pct_show if pct_show is not None else 0) / 100)
+        # 填充满格时右边缘必须与电池框内壁对齐：
+        # 内壁范围是 [bx+2, bx+bw-2]（外框线宽 2），故可用宽度 = bw-4，
+        # 填充再向内留 1px。旧写法按 (bw-6) 缩放，满格时右侧会差 6px，
+        # 看起来像"没充满 / 没对齐"。
+        inner_x0 = bx + 3
+        inner_x1 = bx + bw - 3
+        avail = inner_x1 - inner_x0
+        fw = int(round(avail * (pct_show if pct_show is not None else 0) / 100.0))
         if fw > 0:
-            c.create_rectangle(bx + 3, by + 3, bx + 3 + fw, by + bh - 3,
+            c.create_rectangle(inner_x0, by + 3, inner_x0 + fw, by + bh - 3,
                                fill=fill, outline=fill)
 
         # 百分比 + 状态文字
@@ -1098,6 +1206,7 @@ class BatteryOverlay:
             return
         win = tk.Toplevel(self.root)
         win.overrideredirect(True)
+        _apply_gamepad_icon(win)            # 左上角图标 -> 手柄样式
         win.attributes("-topmost", True)
         try:
             win.attributes("-transparentcolor", MAGIC)
