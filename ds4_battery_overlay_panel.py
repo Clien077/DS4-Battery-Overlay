@@ -21,7 +21,7 @@ BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
-__version__ = "1.2.9"
+__version__ = "1.2.10"
 APP_NAME = "DS4 电量提示"
 
 OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
