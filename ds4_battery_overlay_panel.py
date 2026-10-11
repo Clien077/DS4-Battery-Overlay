@@ -21,7 +21,7 @@ BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
 
 # ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
-__version__ = "1.2.10"
+__version__ = "1.2.11"
 APP_NAME = "DS4 电量提示"
 
 OVERLAY_EXE = os.path.join(BASE, "ds4_battery_overlay.exe")
@@ -289,6 +289,12 @@ class Panel(tk.Tk):
             full if full == "已充满" else
             (("还需 %s" % full) if full else "估算中（插线充电跨档后自动出数）"))
         note = d.get("est_note")
+        lvl = d.get("raw_level")
+        warn = ""
+        if d.get("cable") and lvl == 14:
+            warn = "\n  ※ 手柄报「电压/温度异常，已暂停充电」（档位 14），故不显示百分比"
+        elif d.get("cable") and lvl == 15:
+            warn = "\n  ※ 手柄报「充电故障」（档位 15），故不显示百分比"
         self._note(
             "电池详情（实测）\n"
             "  真实电量  ：%d%%\n"
@@ -297,11 +303,11 @@ class Panel(tk.Tk):
             "  连接方式  ：%s\n"
             "  %s\n"
             "  %s\n"
-            "  数据时间  ：%s%s"
+            "  数据时间  ：%s%s%s"
             % (int(pct),
                d.get("raw_level") if d.get("raw_level") is not None else "—",
                state, conn, rem_line, full_line, d.get("updated") or "—",
-               ("\n  ※ %s" % note) if note else ""),
+               ("\n  ※ %s" % note) if note else "", warn),
             GREEN)
 
     def _note(self, text, color=SUB):

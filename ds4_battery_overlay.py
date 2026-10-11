@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 DS4 电量提示悬浮窗
 ==================
@@ -124,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.10"
+__version__ = "1.2.11"
 APP_NAME = "DS4 电量提示"
 
 W, H = 340, 90
@@ -558,96 +558,115 @@ def read_ds4_battery():
     return None
 
 
-# ---- 充电"平台期"判定（用于推断已充满）----
-# 实测（PID 09CC 蓝牙）：插线充电时状态字节的低 4 位档位**冻结不推进**
-#   （连续 60 秒采样 byte32 恒为 0x98 → level=8，即 80%），
-#   硬件并不通过这个字节上报充电进度。因此不能靠"档位到达某值"判断充满。
-# 可靠的做法：档位长时间不再变化即说明已停止进电 → 判定"已充满"。
-_CHARGE_PLATEAU_SECONDS = 480      # 档位 8 分钟不变即视为充满
+# ---- 充电"平台期"兜底（v1.2.11 起仅作兼容兜底，不再是判定主力）----
+# 历史背景：v1.2.10 曾据"60 秒采样 byte32 恒为 0x98"认定"充电时档位冻结"，
+# 于是改用平台期推断充满。**该结论是错的**：更长时间的实际采样证明档位一直在推进
+#   （19:09 起 0x98 → 19:30 起 0x99，step 间隔约 20-25 分钟）。
+# 插电档位的真实语义见 decode_status()（与 Linux hid-sony 一致），
+# 因此正常路径已能直接判满；平台期只保留为极端固件/链路异常的兜底，
+# 且必须同时满足"插着线 + 档位已在高位 + 长时间不动"才允许判满，
+# 避免在正常充电的台阶之间误报「已充满」。
+_CHARGE_PLATEAU_SECONDS = 1200     # 档位 20 分钟不动才视为已停充
+_CHARGE_PLATEAU_MIN_LEVEL = 9      # 且档位必须已到 9 档（90%）以上才允许兜底判满
 _charge_state = {"level": None, "since": 0.0, "full": False, "charging": False}
 
 
 def _charge_plateau_update(level, charging):
-    """维护充电平台期状态。
+    """维护充电平台期状态（兜底判满）。
 
-    返回 (full, pct)：pct 已按"充满则 100%"处理，避免界面上
-    出现 charging=True 却 pct=100 这种自相矛盾的组合。
+    返回 (full, charging_now)：
+      · 正常情况由 decode_status 直接判满，本函数返回 (False, True)；
+      · 只有在"插线 + 档位 ≥ 9 + 连续 20 分钟不变"时才兜底判满。
     """
     now = time.time()
     st = _charge_state
-    if level >= 10:
-        # 档位 10 即满格（协议里插电满档就是 10）→ 直接判满，无需等平台期
-        st.update(level=level, since=now, full=True, charging=True)
-        return True, 100
     if not charging:
         # 拔线 / 停止充电：重置
         st.update(level=None, since=now, full=False, charging=False)
-        return False, min(100, level * 10)
+        return False, False
+    if level < _CHARGE_PLATEAU_MIN_LEVEL:
+        # 档位还低：正常充电台阶之间必然停留，绝不能在此判满
+        st.update(level=level, since=now, full=False, charging=True)
+        return False, True
     if not st["charging"]:
         # 刚开始充电
         st.update(level=level, since=now, full=False, charging=True)
-        return False, min(100, level * 10)
+        return False, True
     if st["level"] is None or level != st["level"]:
         # 档位有变化 → 仍在进电，重新计时
         st.update(level=level, since=now, full=False)
-        return False, min(100, level * 10)
+        return False, True
     if st["full"]:
-        return True, 100
+        return True, True
     if now - st["since"] >= _CHARGE_PLATEAU_SECONDS:
         st["full"] = True
-        return True, 100
-    return False, min(100, level * 10)
+        return True, True
+    return False, True
 
 
 def decode_status(status, is_bt=False):
     """
-    解析电量状态字节，返回 {"pct","cable","charging","full"}。
+    解析电量状态字节，返回 {"pct","cable","charging","full","level","overcharge"}。
 
-    USB(0x01) 报告 byte30：
-      · 有线充电中（bit4=1）：档位 0-10 → 档×10 为真实充电进度；
-        档位 11-15 为初版 DS4（PID 09CC）充电电压满刻度假象（真实电量
-        不可读），此时用最近一次无线记忆电量显示"充电中"。
-      · 充满（bit4=0 且档位 ≥ 11）：100% 已充满。
-      · 无线（bit4=0 且档位 0-9）：(档位+1)×10。
-    蓝牙(0x11) 报告 byte32（= USB byte30 + 2 字节蓝牙头，与 Linux
-    hid-sony 驱动一致）：bit3-0 = 电量档位，bit4 = USB 线缆状态。
-      · 无线：档位 0-9，电量为 (档位+1)×10（档 9 = 100%）
-      · 插电：**实测档位在充电期间冻结不推进**（连续采样 byte32 恒为
-        0x98 → level 8），故不能按"档位到达某值"判满。改为：
-          电量 = 档位×10，同时用 _charge_plateau_update() 观察档位是否
-          长时间不再变化；一旦平台期超过阈值即判定「已充满」并显示 100%。
+    电量档位（低 4 位）的语义**取决于线缆位（bit4）**，与 Linux hid-sony
+    （dualshock4_parse_report）一致：
+
+      插电（bit4=1）：
+        · 0-9  → 充电进度，档×10%（0=0-9% … 9=90-99%）
+        · 10   → 100%，**仍在充**（收尾）
+        · 11   → **已充满**（100%）
+        · 14   → 电压/温度异常，暂停充电
+        · 15   → 充电故障
+      未插电（bit4=0）：
+        · 0-9  → 档×10%（0=0-9% … 9=90-99%）
+        · 10+  → 100%
+
+    历史坑（即"只能充到 90%"的根因）：旧代码把插电档位 11 当成"充电电压
+    满刻度假象"，转而显示**最近一次无线记忆电量**（如 90%），于是电量冲到
+    90% 后就再也不动、也永远不会显示"已充满"。档位 11 实际就是"已充满"。
+
+    防过充判定用**档位**而非映射后的百分比：档位是按 10% 划分的区间
+    （档 9 = 90-99%），所以"已达阈值"只在跨过阈值档位时才成立 —— 这样
+    阈值设 90% 时，90% 充电中不会催拔线，100% 收尾中才会。
     """
     level = status & 0x0F
     cable = bool(status & 0x10)
-    if is_bt:
-        if cable:
-            # 插电：实测状态字节档位在充电时**冻结不推进**，不能作为充电进度依据。
-            # 用"平台期"判定推断已充满（返回的 pct 已处理为充满即 100%）。
-            full, pct = _charge_plateau_update(level, True)
-            return {"pct": pct, "cable": cable, "level": level,
-                    "charging": not full, "full": full,
-                    "overcharge": bool(pct >= OVERCHARGE_PCT)}
-        _charge_plateau_update(level, False)       # 无线：重置平台期状态
-        pct = min(100, (level + 1) * 10)
-        return {"pct": pct, "cable": cable, "level": level,
-                "charging": False, "full": level >= 9, "overcharge": False}
+    charging = False
+    full = False
+
     if cable:
-        if level <= 10:
-            pct, charging, full = level * 10, True, False
-        else:
-            # 初版 DS4 有线充电：电压满刻度假象 → 用最近无线记忆电量
-            pct = _last_wireless_pct if _last_wireless_pct is not None else 100
-            charging, full = True, False
+        if level in (14, 15):
+            # 14=电压/温度异常暂停充电，15=充电故障：都不猜数字（界面显示 --%）
+            pct, charging = None, True
+        elif level == 11:
+            pct, full = 100, True
+        elif level == 10:
+            pct, charging = 100, True
+        else:                                   # 0-9
+            pct, charging = level * 10, True
     else:
-        if level >= 11:
-            pct, charging, full = 100, False, True     # 充满
-        else:
-            pct = (level + 1) * 10
-            charging, full = False, False
-    pct = max(0, min(100, pct))
+        # 未插电：0-9 → 档×10；10+ → 100%
+        pct = 100 if level >= 10 else level * 10
+
+    # 兜底：仅当"插线 + 档位高位 + 长时间不动"时才额外判满
+    if cable and not full:
+        plateau_full, _charging = _charge_plateau_update(level, charging)
+        if plateau_full:
+            full, charging, pct = True, False, 100
+    elif not cable:
+        _charge_plateau_update(level, False)     # 无线：重置平台期状态
+
+    if pct is not None:
+        pct = max(0, min(100, pct))
+    # 防过充：按档位判定 —— 档位是 10% 宽的区间（档 9 = 90-99%），
+    # 因此"已达阈值"要看是否**跨过**该档位，而不是等于该档位下限。
+    overcharge = False
+    if cable and charging:
+        pct_level = pct // 10 if pct is not None else level
+        overcharge = bool(pct_level * 10 > OVERCHARGE_PCT)
     return {"pct": pct, "cable": cable, "level": level,
             "charging": charging, "full": full,
-            "overcharge": bool(cable and charging and pct >= OVERCHARGE_PCT)}
+            "overcharge": overcharge}
 
 
 def decode_battery(status, is_bt=False):
