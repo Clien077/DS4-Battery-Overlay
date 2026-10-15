@@ -1,4 +1,4 @@
-﻿# DS4 电量提示 · DS4 Battery Overlay
+# DS4 电量提示 · DS4 Battery Overlay
 
 > **本项目的介绍整理与功能改造由 「DeepSeek v4.1 Flash」 修改整理**
 > **Introduction and feature work by 「DeepSeek v4.1 Flash」**
@@ -41,8 +41,8 @@ for **3 seconds**; the always-on-top bar can be toggled with a key combo.
 
 ### Usage
 
-1. Unzip, then double-click **`启动DS4电量提示.bat`** (start the resident program).
-2. Double-click **`打开控制面板.bat`** (open the control panel) — here you can stop/restart the
+1. Unzip, then double-click **`Start-DS4-Battery-Overlay.bat`** (start the resident program).
+2. Double-click **`Open-Control-Panel.bat`** (open the control panel) — here you can stop/restart the
    program, toggle autostart, toggle the overcharge guard, switch the language, view battery
    details and preview the UI.
 3. In game: **double-press PS** to see the level, **D-pad Down + PS** to toggle the top bar.
@@ -101,7 +101,7 @@ for **3 seconds**; the always-on-top bar can be toggled with a key combo.
   本功能是**提醒你拔线**，不是自动断电。
 
 ### 6. 可视化控制面板（免 Python，自包含）
-双击 **`打开控制面板.bat`** 打开图形界面（所有启停逻辑都在面板内，不再依赖其它程序）：
+双击 **`Open-Control-Panel.bat`** 打开图形界面（所有启停逻辑都在面板内，不再依赖其它程序）：
 
 | 功能 | 说明 |
 | --- | --- |
@@ -142,7 +142,7 @@ for **3 seconds**; the always-on-top bar can be toggled with a key combo.
 > 其中**原始档位（0–15）**能直接看出硬件量化精度。
 
 ### 8. 开机自启
-- 开启：双击 **`设置开机自启.bat`** ｜ 取消：双击 **`取消开机自启.bat`**
+- 开启：双击 **`Enable-Autostart.bat`** ｜ 取消：双击 **`Disable-Autostart.bat`**
 - 也可在控制面板里一键开关
 - 通过注册表 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 实现，指向主程序，开机后台常驻
 
@@ -161,8 +161,8 @@ for **3 seconds**; the always-on-top bar can be toggled with a key combo.
 
 本目录已打包为**免 Python 环境**的可执行程序，日常使用只需双击：
 
-1. 双击 **`启动DS4电量提示.bat`** —— 后台启动常驻程序
-2. 双击 **`打开控制面板.bat`** —— 图形界面管理（启停 / 自启 / 防过充 / 电池详情 / 预览）
+1. 双击 **`Start-DS4-Battery-Overlay.bat`** —— 后台启动常驻程序
+2. 双击 **`Open-Control-Panel.bat`** —— 图形界面管理（启停 / 自启 / 防过充 / 电池详情 / 预览）
 3. 之后每次插入 / 连接 DS4 都会弹窗；游戏中**双击 PS 键**弹电量；**十字键下 + PS** 切换顶部横条
 4. 无需手柄预览界面效果：
    ```
@@ -171,20 +171,22 @@ for **3 seconds**; the always-on-top bar can be toggled with a key combo.
    ds4_battery_overlay.exe --version           查看版本
    ```
 
-**目录结构**（v1.2.7 起精简为两个程序）：
+**目录结构**（v1.2.7 起精简为两个程序；**文件名已全部英文化**）：
 ```
-ds4_battery_overlay.exe   常驻主程序（无窗口）
+ds4_battery_overlay.exe   常驻主程序（无窗口）  Resident overlay (no window)
 ds4_overlay_data\         主程序运行库（不要删除）
-ds4_panel.exe             可视化控制面板（自包含）
+ds4_panel.exe             可视化控制面板（自包含）  Control panel (self-contained)
 ds4_panel_data\           面板运行库（不要删除）
-启动DS4电量提示.bat        启动常驻程序
-打开控制面板.bat           打开控制面板
-设置开机自启.bat / 取消开机自启.bat
+Start-DS4-Battery-Overlay.bat   启动常驻程序 / start the resident program
+Open-Control-Panel.bat          打开控制面板 / open the control panel
+Enable-Autostart.bat            设置开机自启 / enable autostart
+Disable-Autostart.bat           取消开机自启 / disable autostart
 *.py                      源码（可选保留）
-README.md                 本文档
-ds4_config.json           设置（防过充开关与阈值，首次运行自动生成）
+README.md                 本文档（中文 + English）
+ds4_config.json           设置（防过充开关、阈值、语言；首次运行自动生成）
 ds4_battery_info.json     电池详情与时长估算数据（运行时生成）
 ds4_battery_state.json    电量记忆（运行时生成）
+_lang.signal              语言变更通知（运行时生成）
 *.log                     运行日志 / 崩溃日志（运行时生成）
 ```
 
@@ -218,7 +220,8 @@ ds4_battery_state.json    电量记忆（运行时生成）
 | 运行后没有任何反应 | 请确认是原装 DS4 或兼容 PID 的设备；其它型号（如 DualSense）不在支持范围。 |
 | 蓝牙连接显示 `--%` | 程序会先读取校准数据激活完整报告模式。仍不行则检查是否被 Steam / DS4Windows 独占。 |
 | 和其它屏幕共享 / 语音软件冲突 | 已修复（v1.1.1 起）：主线程不再做 HID 枚举，句柄被抢占会自动重开。 |
-| 旧版的 `管理DS4电量提示.bat` 打不开 | v1.2.7 已移除命令行管理程序，请改用 `打开控制面板.bat`（功能相同且更直观）。 |
+| 旧版的命令行管理入口 | 命令行管理程序（`ds4_manager.exe`）已在 v1.2.7 随包体精简移除，请改用 `Open-Control-Panel.bat`（功能相同且更直观）。 |
+| 双击 `.bat` 出现两个控制面板窗口 | 已修复：面板新增**单实例保护**，重复双击只会把已有窗口置前，不会再开第二个。 |
 
 ---
 
@@ -270,7 +273,7 @@ ds4_battery_state.json    电量记忆（运行时生成）
 | v1.2.8 | 预计续航 / 预计充满 两个时间常显（插线时沿用上次无线速率）；放宽估算门槛；包体再瘦身 -6 MB |
 | v1.2.9 | 去掉「预估电池真实容量」功能（不再显示任何 mAh 数字） |
 | v1.2.10 | 修复「只能充到 90%」：插电档位 11 = 已充满（10 = 100% 收尾中），14/15 = 异常不猜数字；电量条填充按电池框内壁对齐；窗口/任务栏图标换为手柄；弹窗标记工具窗口不再进任务栏；补齐 `_ctypes` 使任务栏图标生效 |
-| **v1.3** | **控制面板新增语言切换（中文 / 英文），顶部电量横条与底部弹窗同步切换语言（无需重启程序）；README 增加英文介绍** |
+| **v1.3** | **控制面板新增语言切换（中文 / 英文），顶部电量横条、底部弹窗与面板全部文案同步切换（无需重启程序）；面板顶部标题跟随语言；面板新增单实例保护（重复双击不再开出第二个窗口）；删掉指向已移除管理程序的死入口；文件名全部英文化；README 增加英文介绍** |
 
 > 版本号说明：本版按需求使用 **v1.3**。
 

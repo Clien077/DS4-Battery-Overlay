@@ -92,6 +92,8 @@ _TEXTS = {
     "panel.state.running": ('运行中', 'Running'),
     "panel.state.stopped": ('未运行', 'Not running'),
     "panel.window": ('%s v%s · 控制面板', '%s v%s · Control Panel'),
+    # 窗口标题里的程序名单独取词，保证标题栏与顶部标题语言一致（不留中英混显）
+    "panel.window_name": ('DS4 电量提示', 'DS4 Battery Overlay'),
     "popup.charging": ('充电中', 'Charging'),
     "popup.disconnected_sub": ('DS4', 'DS4'),
     "popup.disconnected_title": ('手柄已断开', 'Controller disconnected'),
@@ -403,7 +405,7 @@ class Panel(tk.Tk):
         global _LANG, _LANG_SIG
         _LANG = _load_lang()
         _LANG_SIG = _lang_signal()
-        self.title(_t("panel.window", APP_NAME, __version__))
+        self.title(_t("panel.window", _t("panel.window_name"), __version__))
         self.configure(bg=BG)
         self.resizable(False, False)
         _apply_gamepad_icon(self)          # 左上角图标 -> 手柄样式
@@ -417,8 +419,10 @@ class Panel(tk.Tk):
     def _build(self):
         pad = dict(padx=16)
 
-        tk.Label(self, text=_t("panel.app"), bg=BG, fg=FG,
-                 font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", pady=(14, 0), **pad)
+        # 顶部大标题：保存引用，切换语言时直接改文案（不再靠字号去猜控件）
+        self.app_lbl = tk.Label(self, text=_t("panel.app"), bg=BG, fg=FG,
+                                font=("Microsoft YaHei UI", 14, "bold"))
+        self.app_lbl.pack(anchor="w", pady=(14, 0), **pad)
 
         card = tk.Frame(self, bg=CARD, highlightthickness=0)
         card.pack(fill="x", pady=(10, 12), **pad)
@@ -544,15 +548,8 @@ class Panel(tk.Tk):
     def _retranslate(self):
         """按当前语言重刷面板上所有静态文案。"""
         try:
-            self.title(_t("panel.window", APP_NAME, __version__))
-            for w in self.winfo_children():
-                if isinstance(w, tk.Label) and w is not self.msg:
-                    # 顶部大标题（唯一一个用 14 号粗体的 Label）
-                    try:
-                        if int(w.cget("font").split()[-2]) == 14:
-                            w.configure(text=_t("panel.app"))
-                    except Exception:
-                        pass
+            self.title(_t("panel.window", _t("panel.window_name"), __version__))
+            self.app_lbl.configure(text=_t("panel.app"))
             self.start_btn.configure(text=_t("panel.btn.start"))
             self.stop_btn.configure(text=_t("panel.btn.stop"))
             self.restart_btn.configure(text=_t("panel.btn.restart"))
@@ -712,5 +709,59 @@ class Panel(tk.Tk):
             self._note(_t("panel.note.preview_fail", e), RED)
 
 
+# ---------- 单实例保护 ----------
+# 面板是可反复双击打开的 GUI，若不限制会出现多个窗口（用户反馈：
+# "切换语言后打开了一个新的控制面板窗口" —— 实为重复启动所致）。
+# 与主程序一样用命名互斥体：已有实例则本次退出，并把已有窗口置前。
+_PANEL_MUTEX = None
+_PANEL_MUTEX_NAME = "Global\\DS4BatteryOverlayPanel_SingleInstance"
+
+
+def _single_instance_ok():
+    """返回 True 表示本实例可以继续；False 表示已有实例在运行。"""
+    global _PANEL_MUTEX
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool,
+                                     ctypes.c_wchar_p]
+        k32.GetLastError.restype = ctypes.c_ulong
+        _PANEL_MUTEX = k32.CreateMutexW(None, False, _PANEL_MUTEX_NAME)
+        ERROR_ALREADY_EXISTS = 183
+        if k32.GetLastError() == ERROR_ALREADY_EXISTS:
+            _focus_existing_panel()
+            return False
+        return True
+    except Exception:
+        return True          # 互斥体不可用时不阻碍使用
+
+
+def _focus_existing_panel():
+    """把已在运行的面板窗口置前（给重复启动的用户一个明确反馈）。"""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        u32.FindWindowW.restype = ctypes.c_void_p
+        u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        # Tk 顶层窗口类名固定为 TkTopLevel，标题前缀固定；按标题找不到时
+        # 退化为枚举可见窗口并匹配标题里的版本串
+        for cls in ("TkTopLevel", None):
+            for title in (None,):
+                h = u32.FindWindowW(cls, title)
+                if h:
+                    buf = ctypes.create_unicode_buffer(256)
+                    u32.GetWindowTextW(ctypes.c_void_p(h), buf, 256)
+                    if "DS4" in buf.value and ("控制面板" in buf.value
+                                               or "Control Panel" in buf.value):
+                        u32.ShowWindow(ctypes.c_void_p(h), 9)      # SW_RESTORE
+                        u32.SetForegroundWindow(ctypes.c_void_p(h))
+                        return
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if not _single_instance_ok():
+        raise SystemExit(0)
     Panel().mainloop()
