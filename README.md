@@ -1,14 +1,69 @@
-# DS4 电量提示
+﻿# DS4 电量提示 · DS4 Battery Overlay
 
 > **本项目的介绍整理与功能改造由 「DeepSeek v4.1 Flash」 修改整理**
+> **Introduction and feature work by 「DeepSeek v4.1 Flash」**
 >
-> 当前版本 **v1.2.10** ｜ 版本号同时显示在程序启动日志、控制面板标题与 `--version` 输出中
+> 当前版本 **v1.3** ｜ 版本号同时显示在程序启动日志、控制面板标题与 `--version` 输出中
+> Current version **v1.3** · shown in the startup log, the control-panel title and `--version`
 >
-> **v1.2.10 内更新（版本号不变）**：① 弹窗电量条的绿色填充改为按电池框**内壁宽度**缩放，
-> 满格时右边缘与框内壁对齐（旧版按"内宽−6"缩放，满格时右侧仍差 6px）；
-> ② 程序窗口左上角图标换成**手柄样式**（图标以 base64 内嵌，无需外部文件）。
+> **本版新增**：控制面板可一键切换 **中文 / 英文**，顶部电量横条与底部弹窗**同步**切换语言。
+> **New in this version**: one-click **Chinese / English** switch in the control panel; the top
+> battery bar and the bottom popup follow the selected language.
 >
 > **豆包AI生成**：项目最初由豆包（Doubao）AI 创作完成，后经多轮功能扩展与性能优化。
+
+---
+
+## English Introduction
+
+**DS4 Battery Overlay** shows the battery level of a **DualShock 4** controller on screen.
+Connect (or plug in) the controller and a rounded battery popup appears at the bottom centre
+for **3 seconds**; the always-on-top bar can be toggled with a key combo.
+
+### Features
+
+| Feature | Description |
+| --- | --- |
+| Battery popup | Appears on connect / plug-in, shows the level for 3 s (fade in 0.15 s, fade out 0.35 s) |
+| Charging status | "Charging" / "Fully charged" when on USB; wireless shows a plain percentage |
+| Disconnect notice | Popup when the controller is unplugged |
+| Power events | Bluetooth: plugging/unplugging the charge cable shows a short notice |
+| Low-battery warning | Red highlight at ≤ 20 %; checked every ~30 s, warned once per drop |
+| In-game level check | Double-press **PS** (within 500 ms) to show the level for 2 s |
+| Top battery bar | **D-pad Down + PS** toggles a rounded bar at the top of the screen; refreshes every 2 s, colours by level (≤20 % red / 20–60 % amber / >60 % green) |
+| **Overcharge guard** | Warns you to unplug once the battery reaches a threshold (default 90 %) — the controller's charging circuit is hardware, so software can only *remind* you |
+| Control panel | GUI to start/stop/restart the resident program, toggle autostart, toggle the overcharge guard, view battery details and preview the UI |
+| **Language switch** | **Chinese / English**, switchable in the control panel; both on-screen displays follow instantly |
+| Battery details | Measured level, raw step (0–15), charging state, link type, estimated runtime and time-to-full |
+| Runtime estimate | Estimated "time left" while discharging and "time to full" while charging (based on the measured rate; shows "Estimating" until a full 10 % step has been seen) |
+| Autostart | Registry-based (`HKCU\...\Run`), one click in the panel or the bundled `.bat` files |
+| Robustness | Single-instance guard, HID handle self-healing (survives screen-share / voice-chat apps), watchdog, crash log, resource self-monitoring |
+
+### Usage
+
+1. Unzip, then double-click **`启动DS4电量提示.bat`** (start the resident program).
+2. Double-click **`打开控制面板.bat`** (open the control panel) — here you can stop/restart the
+   program, toggle autostart, toggle the overcharge guard, switch the language, view battery
+   details and preview the UI.
+3. In game: **double-press PS** to see the level, **D-pad Down + PS** to toggle the top bar.
+
+> Please run games in *windowed / borderless* mode: a normal always-on-top window cannot be
+> displayed over an exclusive-fullscreen game, and PS-key listening also fails when another app
+> (Steam, DS4Windows…) holds the controller exclusively.
+
+### Honest notes on accuracy
+
+- The DS4 reports the battery in **10 % steps** (raw step 0–15); this is a hardware limitation,
+  so values such as 0/10/20…100 % are expected.
+- The hardware does **not** expose mAh capacity, cycle count or battery health (all ~50 HID
+  FEATURE reports were enumerated, plus Windows battery devices and WMI). This project therefore
+  does **not** display any fabricated mAh figure.
+- Software **cannot cut the charging circuit**; the overcharge guard is a reminder, not a switch.
+
+---
+
+## 中文介绍
+
 
 插入 / 连接 **DualShock 4 (DS4)** 手柄时，屏幕底部居中弹出电量提示，稳定显示 **3 秒**后自动淡出。
 支持 **USB** 与 **蓝牙** 两种连接方式，也支持「手柄一直插着、程序后启动」的情况（启动时会先弹一次）。
@@ -56,6 +111,10 @@
 | **防过充开关** | 显示当前阈值（如 `关闭防过充(90%)`），点击即开 / 关 |
 | **电池详情** | 查看实测数据 + **预计续航** / **预计充满时长**（见下） |
 | 预览外观 | 无需手柄即可预览电量弹窗与顶部横条效果 |
+| **语言切换（本版新增）** | 一键在 **中文 / 英文** 间切换；面板、顶部电量横条与底部弹窗**同步**切换，设置保存到 `ds4_config.json` |
+
+> **语言切换怎么生效**：面板写配置的同时会写一个 `_lang.signal` 通知文件，常驻程序在轮询
+> 中检测到变化后**立即**用新语言重绘弹窗与顶部横条 —— **无需重启程序**。
 
 ### 7. 电池详情与时长估算（v1.2.8 起两个时间常显；v1.2.9 起不再显示容量估算）
 面板点 **「电池详情」** 查看 —— **预计续航** 与 **预计充满** 会同时显示：
@@ -209,9 +268,11 @@ ds4_battery_state.json    电量记忆（运行时生成）
 | v1.2.6 | 新增防过充；修复管理程序误报实例数量 |
 | v1.2.7 | 新增时长估算；精简包体（移除命令行管理程序）；面板自包含 |
 | v1.2.8 | 预计续航 / 预计充满 两个时间常显（插线时沿用上次无线速率）；放宽估算门槛；包体再瘦身 -6 MB |
-| v1.2.8 | 预计续航 / 预计充满 两个时间常显（插线时沿用上次无线速率）；放宽估算门槛；包体再瘦身 -6 MB |
 | v1.2.9 | 去掉「预估电池真实容量」功能（不再显示任何 mAh 数字） |
-| **v1.2.10** | **修复「只能充到 90%」**：插电档位 11 = 已充满（10 = 100% 收尾中），14/15 = 异常不猜数字；平台期降级为兜底<br>同期内更新：电量条填充按电池框内壁对齐、窗口/任务栏图标换为手柄、弹窗标记工具窗口不再进任务栏、补齐 `_ctypes` 使任务栏图标生效 |
+| v1.2.10 | 修复「只能充到 90%」：插电档位 11 = 已充满（10 = 100% 收尾中），14/15 = 异常不猜数字；电量条填充按电池框内壁对齐；窗口/任务栏图标换为手柄；弹窗标记工具窗口不再进任务栏；补齐 `_ctypes` 使任务栏图标生效 |
+| **v1.3** | **控制面板新增语言切换（中文 / 英文），顶部电量横条与底部弹窗同步切换语言（无需重启程序）；README 增加英文介绍** |
+
+> 版本号说明：本版按需求使用 **v1.3**。
 
 ---
 

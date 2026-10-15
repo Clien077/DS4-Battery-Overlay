@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DS4 电量提示 · 可视化控制面板
 ==============================
@@ -19,9 +19,139 @@ import tkinter as tk
 # 面板自身所在目录（打包 exe 后为本 exe 所在目录）
 BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
     else os.path.dirname(os.path.abspath(__file__))
+# 配置文件路径（防过充开关 / 语言设置），与常驻程序共用同一份
+CONFIG_FILE = os.path.join(BASE, "ds4_config.json")
+
+# ==============================================================
+# 多语言（i18n）：中文 / 英文
+# ==============================================================
+LANG_FILE = os.path.join(BASE, '_lang.signal')
+
+_TEXTS = {
+    "bar.charging": ('充电中', 'Charging'),
+    "bar.disconnected": ('未连接', 'Offline'),
+    "bar.ds4": ('DS4', 'DS4'),
+    "bar.full": ('已充满', 'Full'),
+    "panel.app": ('DS4 电量提示', 'DS4 Battery Overlay'),
+    "panel.autostart.disable": ('关闭开机自启', 'Disable autostart'),
+    "panel.autostart.enable": ('开启开机自启', 'Enable autostart'),
+    "panel.autostart.off": ('开机自启：未开启', 'Autostart: off'),
+    "panel.autostart.on": ('开机自启：已开启', 'Autostart: on'),
+    "panel.btn.details": ('电池详情', 'Battery details'),
+    "panel.btn.lang": ('语言：中文', 'Language: English'),
+    "panel.btn.lang_hint": ('点击切换为英文', 'Click to switch to Chinese'),
+    "panel.btn.preview": ('预览外观', 'Preview'),
+    "panel.btn.refresh": ('刷新状态', 'Refresh'),
+    "panel.btn.restart": ('重启', 'Restart'),
+    "panel.btn.start": ('启动', 'Start'),
+    "panel.btn.stop": ('停止', 'Stop'),
+    "panel.hint": ('提示：右键点击弹出的电量窗可退出常驻程序', 'Tip: right-click the popup to exit the resident program'),
+    "panel.info.charging": ('充电状态  ：%s', 'Charging   ：%s'),
+    "panel.info.conn": ('连接方式  ：%s', 'Link       ：%s'),
+    "panel.info.conn.bt": ('蓝牙无线', 'Bluetooth'),
+    "panel.info.conn.usb": ('USB 有线', 'USB wired'),
+    "panel.info.full_line": ('预计充满  ：%s', 'Charge time：%s'),
+    "panel.info.full_none": ('估算中（插线充电跨档后自动出数）', 'Estimating (appears after one charging step)'),
+    "panel.info.full_val": ('还需 %s', 'about %s to full'),
+    "panel.info.level": ('真实电量  ：%d%%', 'Real level ：%d%%'),
+    "panel.info.no_data": ('暂无电池数据：请先启动常驻程序并连接手柄（数据文件：ds4_battery_info.json）', 'No battery data yet: start the resident program and connect the controller (file: ds4_battery_info.json)'),
+    "panel.info.no_level": ('手柄已连接但未读到电量：可能被其它软件独占，或刚连接尚未出数', 'Controller connected but no level read yet: it may be exclusively held by another app, or just connected'),
+    "panel.info.raw": ('原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限', 'Raw step   ：%s / 15  ← hardware reports in 10%% steps (accuracy ceiling)'),
+    "panel.info.remain": ('预计续航  ：%s', 'Runtime    ：%s'),
+    "panel.info.remain_cached": ('   ← 按上次无线速率推算', '   ← from last wireless rate'),
+    "panel.info.remain_none": ('估算中（跨过一档后自动出数）', 'Estimating (appears after one full step)'),
+    "panel.info.remain_val": ('还能用 %s', 'about %s left'),
+    "panel.info.state.charging": ('充电中', 'Charging'),
+    "panel.info.state.discharging": ('放电中（无线）', 'Discharging (wireless)'),
+    "panel.info.state.full": ('已充满', 'Fully charged'),
+    "panel.info.time": ('数据时间  ：%s%s%s', 'Updated    ：%s%s%s'),
+    "panel.info.title": ('电池详情（实测）', 'Battery details (measured)'),
+    "panel.info.warn14": ('\n  ※ 手柄报「电压/温度异常，已暂停充电」（档位 14），故不显示百分比', '\n  * Controller reports voltage/temperature anomaly (step 14), charging paused — no percentage shown'),
+    "panel.info.warn15": ('\n  ※ 手柄报「充电故障」（档位 15），故不显示百分比', '\n  * Controller reports a charging fault (step 15) — no percentage shown'),
+    "panel.lang.en": ('英文', 'English'),
+    "panel.lang.zh": ('中文', 'Chinese'),
+    "panel.note.autostart_off": ('已取消开机自启', 'Autostart disabled'),
+    "panel.note.autostart_on": ('已开启开机自启', 'Autostart enabled'),
+    "panel.note.cfg_fail": ('写入配置失败：%s', 'Failed to write config: %s'),
+    "panel.note.error": ('操作出错：%s', 'Error: %s'),
+    "panel.note.fail": ('操作失败：%s', 'Failed: %s'),
+    "panel.note.lang": ('语言已切换为%s（顶部与底部电量显示同步切换）', 'Language switched to %s (top & bottom displays updated)'),
+    "panel.note.not_running": ('程序本来就没在运行', 'It was not running'),
+    "panel.note.oc_off": ('防过充已关闭', 'Overcharge guard off'),
+    "panel.note.oc_on": ('防过充已开启：插着线且电量达到 %d%% 时弹窗提醒拔线\n（软件无法切断充电电路，只能提醒）', 'Overcharge guard on: warns you to unplug when the battery reaches %d%%\n(software cannot cut the charging circuit)'),
+    "panel.note.preview": ('已预览 66% 弹窗 + 顶部横条（观察屏幕底部/顶部）', 'Previewed 66% popup + top bar (check screen top/bottom)'),
+    "panel.note.preview_fail": ('预览失败：%s', 'Preview failed: %s'),
+    "panel.note.restarted": ('已重启常驻程序', 'Resident program restarted'),
+    "panel.note.started": ('已启动常驻程序', 'Resident program started'),
+    "panel.note.stopped": ('已停止 %d 个实例', 'Stopped %d instance(s)'),
+    "panel.overcharge.off": ('开启防过充(%d%%)', 'Enable guard (%d%%)'),
+    "panel.overcharge.on": ('关闭防过充(%d%%)', 'Disable guard (%d%%)'),
+    "panel.pid": ('进程 PID：', 'PID: '),
+    "panel.pid.none": ('进程 PID：—', 'PID: —'),
+    "panel.state.checking": ('检测中…', 'Checking…'),
+    "panel.state.running": ('运行中', 'Running'),
+    "panel.state.stopped": ('未运行', 'Not running'),
+    "panel.window": ('%s v%s · 控制面板', '%s v%s · Control Panel'),
+    "popup.charging": ('充电中', 'Charging'),
+    "popup.disconnected_sub": ('DS4', 'DS4'),
+    "popup.disconnected_title": ('手柄已断开', 'Controller disconnected'),
+    "popup.dualshock": ('DUALSHOCK 4', 'DUALSHOCK 4'),
+    "popup.full": ('已充满', 'Fully charged'),
+    "popup.low": ('低电量 · 请及时充电', 'Low battery · please charge'),
+    "popup.overcharge_sub": ('电量 %s%% · 防过充（已达 %d%%）', 'Battery %s%% · overcharge guard (%d%%)'),
+    "popup.overcharge_title": ('请拔掉充电线', 'Please unplug the charger'),
+    "popup.power_off": ('已断开电源', 'Power disconnected'),
+    "popup.power_on": ('接入电源', 'Power connected'),
+    "time.estimating": ('估算中', 'Estimating'),
+    "time.estimating_long": ('估算中（手柄按 10% 一档上报，需累积到跨档才能算速率）', 'Estimating (DS4 reports in 10% steps; needs a full step to compute a rate)'),
+    "time.full": ('已充满', 'Full'),
+    "time.hours": ('约 %d 小时 %d 分钟', '~%dh %dm'),
+    "time.lt1min": ('不到 1 分钟', '< 1 min'),
+    "time.minutes": ('约 %d 分钟', '~%d min'),
+}
+
+
+def _norm_lang(v):
+    v = (v or "").strip().lower()
+    return "en" if v.startswith("en") else "zh"
+
+
+def _load_lang():
+    """语言取自 ds4_config.json 的 lang 字段；缺省中文。"""
+    try:
+        import json
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return _norm_lang((json.load(f) or {}).get("lang"))
+    except Exception:
+        return "zh"
+
+
+def _t(key, *args):
+    """取当前语言文案；带 %s/%d 占位时自动格式化。"""
+    pair = _TEXTS.get(key)
+    if not pair:
+        return key
+    s = pair[1] if _LANG == "en" else pair[0]
+    try:
+        return s % args if args else s
+    except Exception:
+        return s
+
+
+def _lang_signal():
+    """返回语言信号文件的修改时间；面板切换语言后会重写它。"""
+    try:
+        return os.path.getmtime(LANG_FILE)
+    except OSError:
+        return 0.0
+
+
+_LANG = "zh"
+_LANG_SIG = 0.0
+
 
 # ---- 版本号：与主程序保持一致（升级时同步修改同名常量）----
-__version__ = "1.2.10"
+__version__ = "1.3"
 
 
 # ---- 手柄图标（base64 内嵌，避免依赖外部文件；打包后同样可用）----
@@ -250,7 +380,7 @@ def set_autostart(on):
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
                                 winreg.KEY_SET_VALUE) as k:
                 winreg.SetValueEx(k, AUTOSTART_NAME, 0, winreg.REG_SZ, cmd)
-            return True, "已开启开机自启"
+            return True, _t("panel.note.autostart_on")
         else:
             exe = OVERLAY_EXE if os.path.exists(OVERLAY_EXE) else sys.executable
             subprocess.run([exe, "--no-autostart"], capture_output=True, timeout=20)
@@ -261,15 +391,19 @@ def set_autostart(on):
                     winreg.DeleteValue(k, AUTOSTART_NAME)
             except FileNotFoundError:
                 pass
-            return True, "已取消开机自启"
+            return True, _t("panel.note.autostart_off")
     except Exception as e:
-        return False, "操作失败：%s" % e
+        return False, _t("panel.note.fail", e)
 
 
 class Panel(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("%s v%s · 控制面板" % (APP_NAME, __version__))
+        # 按配置里的语言启动（与常驻程序共用 ds4_config.json 的 lang 字段）
+        global _LANG, _LANG_SIG
+        _LANG = _load_lang()
+        _LANG_SIG = _lang_signal()
+        self.title(_t("panel.window", APP_NAME, __version__))
         self.configure(bg=BG)
         self.resizable(False, False)
         _apply_gamepad_icon(self)          # 左上角图标 -> 手柄样式
@@ -283,7 +417,7 @@ class Panel(tk.Tk):
     def _build(self):
         pad = dict(padx=16)
 
-        tk.Label(self, text="DS4 电量提示", bg=BG, fg=FG,
+        tk.Label(self, text=_t("panel.app"), bg=BG, fg=FG,
                  font=("Microsoft YaHei UI", 14, "bold")).pack(anchor="w", pady=(14, 0), **pad)
 
         card = tk.Frame(self, bg=CARD, highlightthickness=0)
@@ -291,7 +425,7 @@ class Panel(tk.Tk):
 
         self.dot = tk.Label(card, text="●", bg=CARD, fg=SUB, font=("Segoe UI", 16))
         self.dot.grid(row=0, column=0, padx=(14, 6), pady=(12, 2), sticky="w")
-        self.state_lbl = tk.Label(card, text="检测中…", bg=CARD, fg=FG,
+        self.state_lbl = tk.Label(card, text=_t("panel.state.checking"), bg=CARD, fg=FG,
                                   font=("Microsoft YaHei UI", 12, "bold"))
         self.state_lbl.grid(row=0, column=1, columnspan=2, pady=(12, 2), sticky="w")
 
@@ -308,31 +442,42 @@ class Panel(tk.Tk):
         for i in range(3):
             btns.columnconfigure(i, weight=1)
 
-        self._btn(btns, "启动", GREEN, lambda: self.act("start")).grid(
-            row=0, column=0, sticky="ew", padx=(0, 5))
-        self._btn(btns, "停止", RED, lambda: self.act("stop")).grid(
-            row=0, column=1, sticky="ew", padx=5)
-        self._btn(btns, "重启", BLUE, lambda: self.act("restart")).grid(
-            row=0, column=2, sticky="ew", padx=(5, 0))
+        self.start_btn = self._btn(btns, _t("panel.btn.start"), GREEN,
+                                   lambda: self.act("start"))
+        self.start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.stop_btn = self._btn(btns, _t("panel.btn.stop"), RED,
+                                  lambda: self.act("stop"))
+        self.stop_btn.grid(row=0, column=1, sticky="ew", padx=5)
+        self.restart_btn = self._btn(btns, _t("panel.btn.restart"), BLUE,
+                                     lambda: self.act("restart"))
+        self.restart_btn.grid(row=0, column=2, sticky="ew", padx=(5, 0))
 
-        self._btn(btns, "刷新状态", CARD, self.refresh, fg=FG).grid(
-            row=1, column=0, sticky="ew", padx=(0, 5), pady=(8, 0))
-        self.auto_btn = self._btn(btns, "开机自启：开", CARD, self.toggle_autostart, fg=FG)
+        self.refresh_btn = self._btn(btns, _t("panel.btn.refresh"), CARD,
+                                     self.refresh, fg=FG)
+        self.refresh_btn.grid(row=1, column=0, sticky="ew", padx=(0, 5), pady=(8, 0))
+        self.auto_btn = self._btn(btns, _t("panel.autostart.enable"), CARD,
+                                  self.toggle_autostart, fg=FG)
         self.auto_btn.grid(row=1, column=1, sticky="ew", padx=5, pady=(8, 0))
-        self._btn(btns, "预览外观", CARD, self.preview, fg=FG).grid(
-            row=1, column=2, sticky="ew", padx=(5, 0), pady=(8, 0))
+        self.preview_btn = self._btn(btns, _t("panel.btn.preview"), CARD,
+                                     self.preview, fg=FG)
+        self.preview_btn.grid(row=1, column=2, sticky="ew", padx=(5, 0), pady=(8, 0))
 
-        self.over_btn = self._btn(btns, "防过充：开", CARD, self.toggle_overcharge,
-                                  fg=FG)
+        self.over_btn = self._btn(btns, _t("panel.overcharge.off", 90), CARD,
+                                  self.toggle_overcharge, fg=FG)
         self.over_btn.grid(row=2, column=0, columnspan=2, sticky="ew",
                            padx=(0, 5), pady=(8, 0))
-        self._btn(btns, "电池详情", CARD, self.show_battery_info,
-                  fg=FG).grid(row=2, column=2, sticky="ew", pady=(8, 0))
+        self.detail_btn = self._btn(btns, _t("panel.btn.details"), CARD,
+                                    self.show_battery_info, fg=FG)
+        self.detail_btn.grid(row=2, column=2, sticky="ew", pady=(8, 0))
 
-        self.msg = tk.Label(self, text="提示：右键点击弹出的电量窗可退出常驻程序",
+        # 语言切换：点击即在中文 / 英文之间切换（会同步通知常驻程序重绘两条显示条）
+        self.lang_btn = self._btn(btns, _t("panel.btn.lang"), CARD,
+                                  self.toggle_language, fg=FG)
+        self.lang_btn.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+
+        self.msg = tk.Label(self, text=_t("panel.hint"),
                             bg=BG, fg=SUB, font=("Microsoft YaHei UI", 9),
                             wraplength=380, justify="left")
-        self.msg.pack(anchor="w", pady=(12, 14), **pad)
         self.msg.pack(anchor="w", pady=(12, 14), **pad)
 
     def _btn(self, parent, text, color, cmd, fg=None):
@@ -347,25 +492,77 @@ class Panel(tk.Tk):
         pids = find_overlay_pids()
         if pids:
             self.dot.configure(fg=GREEN)
-            self.state_lbl.configure(text="运行中")
-            self.pid_lbl.configure(text="进程 PID：" + "、".join(str(p) for p in pids))
+            self.state_lbl.configure(text=_t("panel.state.running"))
+            self.pid_lbl.configure(text=_t("panel.pid")
+                                   + "、".join(str(p) for p in pids))
         else:
             self.dot.configure(fg=RED)
-            self.state_lbl.configure(text="未运行")
-            self.pid_lbl.configure(text="进程 PID：—")
+            self.state_lbl.configure(text=_t("panel.state.stopped"))
+            self.pid_lbl.configure(text=_t("panel.pid.none"))
 
         on = autostart_enabled()
         self.auto_lbl.configure(
-            text="开机自启：" + ("已开启" if on else "未开启"),
-            fg=GREEN if on else SUB)
-        # 按钮文案表示"点击后要做的事"：已开启 → 点击可关闭
-        self.auto_btn.configure(text="关闭开机自启" if on else "开启开机自启")
+            text=_t("panel.autostart.on") if on else _t("panel.autostart.off"),
+            fg=GREEN if on else SUB)        # 按钮文案表示"点击后要做的事"：已开启 → 点击可关闭
+        self.auto_btn.configure(text=_t("panel.autostart.disable") if on
+                                else _t("panel.autostart.enable"))
 
         # 防过充状态（阈值与开关存在 ds4_config.json）
         cfg = self._read_config()
         oc_on = bool(cfg.get("overcharge_enabled", True))
-        self.over_btn.configure(text=("关闭防过充" if oc_on else "开启防过充")
-                                + "(%d%%)" % int(cfg.get("overcharge_pct") or 90))
+        pct = int(cfg.get("overcharge_pct") or 90)
+        self.over_btn.configure(text=_t("panel.overcharge.on" if oc_on
+                                        else "panel.overcharge.off", pct))
+
+        # 语言按钮：显示"点击后要切换到的语言"
+        self.lang_btn.configure(text=_t("panel.btn.lang"))
+
+    # ---------- 语言切换 ----------
+    def toggle_language(self):
+        """在中文 / 英文之间切换，并通知常驻程序立即重绘两条显示条。"""
+        import json
+        global _LANG
+        cfg = self._read_config()
+        target = "en" if _LANG == "zh" else "zh"
+        cfg["lang"] = target
+        try:
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            # 写语言信号：常驻程序轮询到变化后立即用新语言重绘弹窗与顶栏
+            with open(LANG_FILE, "w", encoding="utf-8") as f:
+                f.write("%s %.6f\n" % (target, time.time()))
+        except Exception as e:
+            self._note(_t("panel.note.cfg_fail", e), RED)
+            return
+        _LANG = target
+        self._retranslate()
+        self.refresh()
+        self._note(_t("panel.note.lang",
+                      _t("panel.lang.en" if target == "en" else "panel.lang.zh")),
+                   GREEN)
+
+    def _retranslate(self):
+        """按当前语言重刷面板上所有静态文案。"""
+        try:
+            self.title(_t("panel.window", APP_NAME, __version__))
+            for w in self.winfo_children():
+                if isinstance(w, tk.Label) and w is not self.msg:
+                    # 顶部大标题（唯一一个用 14 号粗体的 Label）
+                    try:
+                        if int(w.cget("font").split()[-2]) == 14:
+                            w.configure(text=_t("panel.app"))
+                    except Exception:
+                        pass
+            self.start_btn.configure(text=_t("panel.btn.start"))
+            self.stop_btn.configure(text=_t("panel.btn.stop"))
+            self.restart_btn.configure(text=_t("panel.btn.restart"))
+            self.refresh_btn.configure(text=_t("panel.btn.refresh"))
+            self.preview_btn.configure(text=_t("panel.btn.preview"))
+            self.detail_btn.configure(text=_t("panel.btn.details"))
+            self.lang_btn.configure(text=_t("panel.btn.lang"))
+            self.msg.configure(text=_t("panel.hint"))
+        except Exception:
+            pass
 
     # ---------- 配置（防过充） ----------
     @staticmethod
@@ -391,15 +588,13 @@ class Panel(tk.Tk):
             with open(self._config_path(), "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            self._note("写入配置失败：%s" % e, RED)
+            self._note(_t("panel.note.cfg_fail", e), RED)
             return
         self.refresh()
         if cfg["overcharge_enabled"]:
-            self._note("防过充已开启：插着线且电量达到 %d%% 时弹窗提醒拔线\n"
-                       "（软件无法切断充电电路，只能提醒）"
-                       % int(cfg["overcharge_pct"]), GREEN)
+            self._note(_t("panel.note.oc_on", int(cfg["overcharge_pct"])), GREEN)
         else:
-            self._note("防过充已关闭", YELLOW)
+            self._note(_t("panel.note.oc_off"), YELLOW)
 
     def show_battery_info(self):
         """电池详情：读取常驻程序写下的最新实测数据。
@@ -414,53 +609,52 @@ class Panel(tk.Tk):
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
         except Exception:
-            self._note("暂无电池数据：请先启动常驻程序并连接手柄"
-                       "（数据文件：ds4_battery_info.json）", YELLOW)
+            self._note(_t("panel.info.no_data"), YELLOW)
             return
         pct = d.get("pct")
         if pct is None:
-            self._note("手柄已连接但未读到电量：可能被其它软件独占，"
-                       "或刚连接尚未出数", YELLOW)
+            self._note(_t("panel.info.no_level"), YELLOW)
             return
         if d.get("full"):
-            state = "已充满"
+            state = _t("panel.info.state.full")
         elif d.get("charging"):
-            state = "充电中"
+            state = _t("panel.info.state.charging")
         else:
-            state = "放电中（无线）"
-        conn = "USB 有线" if d.get("cable") else "蓝牙无线"
+            state = _t("panel.info.state.discharging")
+        conn = _t("panel.info.conn.usb") if d.get("cable") else _t("panel.info.conn.bt")
         # 两个时间都常显：续航（放电速率）+ 充满时长（充电速率）
         rem = d.get("est_remaining")
         full = d.get("est_full")
         if d.get("full"):
-            full = "已充满"
-        rem_line = "预计续航  ：%s" % (
-            ("还能用 %s" % rem) if rem else "估算中（跨过一档后自动出数）")
+            full = _t("time.full")
+        rem_line = _t("panel.info.remain",
+                      (_t("panel.info.remain_val", rem) if rem
+                       else _t("panel.info.remain_none")))
         if d.get("est_remaining_cached") and rem:
-            rem_line += "   ← 按上次无线速率推算"
-        full_line = "预计充满  ：%s" % (
-            full if full == "已充满" else
-            (("还需 %s" % full) if full else "估算中（插线充电跨档后自动出数）"))
+            rem_line += _t("panel.info.remain_cached")
+        full_line = _t("panel.info.full_line",
+                       full if full == _t("time.full") else
+                       (_t("panel.info.full_val", full) if full
+                        else _t("panel.info.full_none")))
         note = d.get("est_note")
         lvl = d.get("raw_level")
         warn = ""
         if d.get("cable") and lvl == 14:
-            warn = "\n  ※ 手柄报「电压/温度异常，已暂停充电」（档位 14），故不显示百分比"
+            warn = _t("panel.info.warn14")
         elif d.get("cable") and lvl == 15:
-            warn = "\n  ※ 手柄报「充电故障」（档位 15），故不显示百分比"
+            warn = _t("panel.info.warn15")
         self._note(
-            "电池详情（实测）\n"
-            "  真实电量  ：%d%%\n"
-            "  原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限\n"
-            "  充电状态  ：%s\n"
-            "  连接方式  ：%s\n"
-            "  %s\n"
-            "  %s\n"
-            "  数据时间  ：%s%s%s"
-            % (int(pct),
-               d.get("raw_level") if d.get("raw_level") is not None else "—",
-               state, conn, rem_line, full_line, d.get("updated") or "—",
-               ("\n  ※ %s" % note) if note else "", warn),
+            (_t("panel.info.title") + "\n"
+             + _t("panel.info.level", int(pct)) + "\n"
+             + _t("panel.info.raw",
+                  d.get("raw_level") if d.get("raw_level") is not None else "—")
+             + "\n"
+             + _t("panel.info.charging", state) + "\n"
+             + _t("panel.info.conn", conn) + "\n"
+             + rem_line + "\n"
+             + full_line + "\n"
+             + _t("panel.info.time", d.get("updated") or "—",
+                  ("\n  ※ %s" % note) if note else "", warn)),
             GREEN)
 
     def _note(self, text, color=SUB):
@@ -488,17 +682,18 @@ class Panel(tk.Tk):
         try:
             if what == "start":
                 self.start_overlay()
-                self._note("已启动常驻程序", GREEN)
+                self._note(_t("panel.note.started"), GREEN)
             elif what == "stop":
                 n = self.stop_overlay()
-                self._note("已停止 %d 个实例" % n if n else "程序本来就没在运行", RED)
+                self._note(_t("panel.note.stopped", n) if n
+                           else _t("panel.note.not_running"), RED)
             elif what == "restart":
                 self.stop_overlay()
                 time.sleep(1.2)
                 self.start_overlay()
-                self._note("已重启常驻程序", BLUE)
+                self._note(_t("panel.note.restarted"), BLUE)
         except Exception as e:
-            self._note("操作出错：%s" % e, RED)
+            self._note(_t("panel.note.error", e), RED)
         self.after(600, self.refresh)
 
     def toggle_autostart(self):
@@ -512,9 +707,9 @@ class Panel(tk.Tk):
             subprocess.Popen(target_cmd(["--preview", "66"]), close_fds=True)
             self.after(1200, lambda: subprocess.Popen(
                 target_cmd(["--preview-bar", "66"]), close_fds=True))
-            self._note("已预览 66% 弹窗 + 顶部横条（观察屏幕底部/顶部）", BLUE)
+            self._note(_t("panel.note.preview"), BLUE)
         except Exception as e:
-            self._note("预览失败：%s" % e, RED)
+            self._note(_t("panel.note.preview_fail", e), RED)
 
 
 if __name__ == "__main__":

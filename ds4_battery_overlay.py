@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DS4 电量提示悬浮窗
 ==================
@@ -124,7 +124,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.2.10"
+__version__ = "1.3"
 
 
 # ---- 手柄图标（base64 内嵌，避免依赖外部文件；打包后同样可用）----
@@ -301,7 +301,139 @@ LOG_KEEP_LINES = 200         # 裁剪时保留最近 200 行
 # 的电量字节会跳到 11 档（充电电压满刻度），无法读出真实电量，
 # 用最近一次无线读数代替显示"充电中 X%"。持久化到状态文件，重启不丢。
 STATE_FILE = os.path.join(BASE_DIR, "ds4_battery_state.json")
-CONFIG_FILE = os.path.join(BASE_DIR, "ds4_config.json")   # 防过充等设置
+CONFIG_FILE = os.path.join(BASE_DIR, "ds4_config.json")   # 防过充 / 语言等设置
+
+# ==============================================================
+# 多语言（i18n）：中文 / 英文
+# ==============================================================
+LANG_FILE = os.path.join(BASE_DIR, '_lang.signal')
+
+_TEXTS = {
+    "bar.charging": ('充电中', 'Charging'),
+    "bar.disconnected": ('未连接', 'Offline'),
+    "bar.ds4": ('DS4', 'DS4'),
+    "bar.full": ('已充满', 'Full'),
+    "panel.app": ('DS4 电量提示', 'DS4 Battery Overlay'),
+    "panel.autostart.disable": ('关闭开机自启', 'Disable autostart'),
+    "panel.autostart.enable": ('开启开机自启', 'Enable autostart'),
+    "panel.autostart.off": ('开机自启：未开启', 'Autostart: off'),
+    "panel.autostart.on": ('开机自启：已开启', 'Autostart: on'),
+    "panel.btn.details": ('电池详情', 'Battery details'),
+    "panel.btn.lang": ('语言：中文', 'Language: English'),
+    "panel.btn.lang_hint": ('点击切换为英文', 'Click to switch to Chinese'),
+    "panel.btn.preview": ('预览外观', 'Preview'),
+    "panel.btn.refresh": ('刷新状态', 'Refresh'),
+    "panel.btn.restart": ('重启', 'Restart'),
+    "panel.btn.start": ('启动', 'Start'),
+    "panel.btn.stop": ('停止', 'Stop'),
+    "panel.hint": ('提示：右键点击弹出的电量窗可退出常驻程序', 'Tip: right-click the popup to exit the resident program'),
+    "panel.info.charging": ('充电状态  ：%s', 'Charging   ：%s'),
+    "panel.info.conn": ('连接方式  ：%s', 'Link       ：%s'),
+    "panel.info.conn.bt": ('蓝牙无线', 'Bluetooth'),
+    "panel.info.conn.usb": ('USB 有线', 'USB wired'),
+    "panel.info.full_line": ('预计充满  ：%s', 'Charge time：%s'),
+    "panel.info.full_none": ('估算中（插线充电跨档后自动出数）', 'Estimating (appears after one charging step)'),
+    "panel.info.full_val": ('还需 %s', 'about %s to full'),
+    "panel.info.level": ('真实电量  ：%d%%', 'Real level ：%d%%'),
+    "panel.info.no_data": ('暂无电池数据：请先启动常驻程序并连接手柄（数据文件：ds4_battery_info.json）', 'No battery data yet: start the resident program and connect the controller (file: ds4_battery_info.json)'),
+    "panel.info.no_level": ('手柄已连接但未读到电量：可能被其它软件独占，或刚连接尚未出数', 'Controller connected but no level read yet: it may be exclusively held by another app, or just connected'),
+    "panel.info.raw": ('原始档位  ：%s / 15  ← 硬件按 10%% 一档上报，这是精度上限', 'Raw step   ：%s / 15  ← hardware reports in 10%% steps (accuracy ceiling)'),
+    "panel.info.remain": ('预计续航  ：%s', 'Runtime    ：%s'),
+    "panel.info.remain_cached": ('   ← 按上次无线速率推算', '   ← from last wireless rate'),
+    "panel.info.remain_none": ('估算中（跨过一档后自动出数）', 'Estimating (appears after one full step)'),
+    "panel.info.remain_val": ('还能用 %s', 'about %s left'),
+    "panel.info.state.charging": ('充电中', 'Charging'),
+    "panel.info.state.discharging": ('放电中（无线）', 'Discharging (wireless)'),
+    "panel.info.state.full": ('已充满', 'Fully charged'),
+    "panel.info.time": ('数据时间  ：%s%s%s', 'Updated    ：%s%s%s'),
+    "panel.info.title": ('电池详情（实测）', 'Battery details (measured)'),
+    "panel.info.warn14": ('\n  ※ 手柄报「电压/温度异常，已暂停充电」（档位 14），故不显示百分比', '\n  * Controller reports voltage/temperature anomaly (step 14), charging paused — no percentage shown'),
+    "panel.info.warn15": ('\n  ※ 手柄报「充电故障」（档位 15），故不显示百分比', '\n  * Controller reports a charging fault (step 15) — no percentage shown'),
+    "panel.lang.en": ('英文', 'English'),
+    "panel.lang.zh": ('中文', 'Chinese'),
+    "panel.note.autostart_off": ('已取消开机自启', 'Autostart disabled'),
+    "panel.note.autostart_on": ('已开启开机自启', 'Autostart enabled'),
+    "panel.note.cfg_fail": ('写入配置失败：%s', 'Failed to write config: %s'),
+    "panel.note.error": ('操作出错：%s', 'Error: %s'),
+    "panel.note.fail": ('操作失败：%s', 'Failed: %s'),
+    "panel.note.lang": ('语言已切换为%s（顶部与底部电量显示同步切换）', 'Language switched to %s (top & bottom displays updated)'),
+    "panel.note.not_running": ('程序本来就没在运行', 'It was not running'),
+    "panel.note.oc_off": ('防过充已关闭', 'Overcharge guard off'),
+    "panel.note.oc_on": ('防过充已开启：插着线且电量达到 %d%% 时弹窗提醒拔线\n（软件无法切断充电电路，只能提醒）', 'Overcharge guard on: warns you to unplug when the battery reaches %d%%\n(software cannot cut the charging circuit)'),
+    "panel.note.preview": ('已预览 66% 弹窗 + 顶部横条（观察屏幕底部/顶部）', 'Previewed 66% popup + top bar (check screen top/bottom)'),
+    "panel.note.preview_fail": ('预览失败：%s', 'Preview failed: %s'),
+    "panel.note.restarted": ('已重启常驻程序', 'Resident program restarted'),
+    "panel.note.started": ('已启动常驻程序', 'Resident program started'),
+    "panel.note.stopped": ('已停止 %d 个实例', 'Stopped %d instance(s)'),
+    "panel.overcharge.off": ('开启防过充(%d%%)', 'Enable guard (%d%%)'),
+    "panel.overcharge.on": ('关闭防过充(%d%%)', 'Disable guard (%d%%)'),
+    "panel.pid": ('进程 PID：', 'PID: '),
+    "panel.pid.none": ('进程 PID：—', 'PID: —'),
+    "panel.state.checking": ('检测中…', 'Checking…'),
+    "panel.state.running": ('运行中', 'Running'),
+    "panel.state.stopped": ('未运行', 'Not running'),
+    "panel.window": ('%s v%s · 控制面板', '%s v%s · Control Panel'),
+    "popup.charging": ('充电中', 'Charging'),
+    "popup.disconnected_sub": ('DS4', 'DS4'),
+    "popup.disconnected_title": ('手柄已断开', 'Controller disconnected'),
+    "popup.dualshock": ('DUALSHOCK 4', 'DUALSHOCK 4'),
+    "popup.full": ('已充满', 'Fully charged'),
+    "popup.low": ('低电量 · 请及时充电', 'Low battery · please charge'),
+    "popup.overcharge_sub": ('电量 %s%% · 防过充（已达 %d%%）', 'Battery %s%% · overcharge guard (%d%%)'),
+    "popup.overcharge_title": ('请拔掉充电线', 'Please unplug the charger'),
+    "popup.power_off": ('已断开电源', 'Power disconnected'),
+    "popup.power_on": ('接入电源', 'Power connected'),
+    "time.estimating": ('估算中', 'Estimating'),
+    "time.estimating_long": ('估算中（手柄按 10% 一档上报，需累积到跨档才能算速率）', 'Estimating (DS4 reports in 10% steps; needs a full step to compute a rate)'),
+    "time.full": ('已充满', 'Full'),
+    "time.hours": ('约 %d 小时 %d 分钟', '~%dh %dm'),
+    "time.lt1min": ('不到 1 分钟', '< 1 min'),
+    "time.minutes": ('约 %d 分钟', '~%d min'),
+}
+
+
+def _norm_lang(v):
+    v = (v or "").strip().lower()
+    return "en" if v.startswith("en") else "zh"
+
+
+def _load_lang():
+    """语言取自 ds4_config.json 的 lang 字段；缺省中文。"""
+    try:
+        import json
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return _norm_lang((json.load(f) or {}).get("lang"))
+    except Exception:
+        return "zh"
+
+
+def _t(key, *args):
+    """取当前语言文案；带 %s/%d 占位时自动格式化。"""
+    pair = _TEXTS.get(key)
+    if not pair:
+        return key
+    s = pair[1] if _LANG == "en" else pair[0]
+    try:
+        return s % args if args else s
+    except Exception:
+        return s
+
+
+def _lang_signal():
+    """返回语言信号文件的修改时间；面板切换语言后会重写它。"""
+    try:
+        return os.path.getmtime(LANG_FILE)
+    except OSError:
+        return 0.0
+
+
+_LANG = "zh"
+_LANG_SIG = 0.0
+
+# 启动时按配置里的语言初始化（面板切换语言时会同时写 _lang.signal 触发热重载）
+_LANG = _load_lang()
+_LANG_SIG = _lang_signal()
+
 _last_wireless_pct = None
 _last_save_ts = 0.0       # 状态文件写入限频时间戳
 _last_saved_pct = None    # 状态文件已保存值（去重）
@@ -376,15 +508,15 @@ OVERCHARGE_PCT = int(_cfg.get("overcharge_pct") or OVERCHARGE_DEFAULT_PCT)
 
 
 def _fmt_minutes(minutes):
-    """把分钟数格式化为"约 X 小时 Y 分钟"。"""
+    """把分钟数格式化为本地语言（中文：约 X 小时 Y 分钟 / 英文：~Xh Ym）。"""
     if minutes is None:
         return None
     m = int(round(minutes))
     if m < 1:
-        return "不到 1 分钟"
+        return _t("time.lt1min")
     if m < 60:
-        return "约 %d 分钟" % m
-    return "约 %d 小时 %d 分钟" % (m // 60, m % 60)
+        return _t("time.minutes", m)
+    return _t("time.hours", m // 60, m % 60)
 
 
 class UsageEstimator:
@@ -483,13 +615,13 @@ class UsageEstimator:
             return None
         pct, rate = tr
         if pct >= 100:
-            return "已充满"
+            return _t("time.full")
         return _fmt_minutes((100 - pct) / rate)
 
     def note(self, remaining=None, full=None):
         """给界面的简短说明：只有两个估算都拿不到时才提示需要累积数据。"""
         if remaining is None and full is None:
-            return "估算中（手柄按 10% 一档上报，需累积到跨档才能算速率）"
+            return _t("time.estimating_long")
         return None
 
 
@@ -1189,6 +1321,10 @@ class BatteryOverlay:
         self._last_queued = {}        # 事件类型 -> 上次入队时间（防触发风暴）
         self.bar_last_data = None     # 横条最近一次真实数据（切换时立即上屏用）
         self.bar_last_pct = None      # 横条最近一次已知电量（跨断开保留，避免灰轨道）
+        # 弹窗最近一次绘制内容：语言切换后据此立即用新语言重画
+        self.last_pct = None
+        self.last_charging = False
+        self.last_full = False
         self._res_sample_ts = time.time()   # 资源自监控采样时间戳
         self._last_dev_poll = 0.0           # 上次设备枚举时间（未连接时降频用）
         self._bar_items = {}                # 横条画布元素 id 缓存（原地更新用）
@@ -1208,6 +1344,8 @@ class BatteryOverlay:
     def draw_battery(self, percent, charging=False, full=False):
         c = self.canvas
         c.delete("all")
+        # 记住本次内容，供语言切换后立即用新语言重画（无需再读一次设备）
+        self.last_pct, self.last_charging, self.last_full = percent, charging, full
         low = percent is not None and percent <= LOW_BATTERY_PCT
         border = BAT_LOW if low else PANEL_BORDER
         round_rect(c, 4, 4, W - 4, H - 4, 24, fill=PANEL_BG,
@@ -1249,13 +1387,13 @@ class BatteryOverlay:
                       font=("Segoe UI", 30, "bold"),
                       fill=BAT_LOW if low else TEXT_MAIN)
         if low:
-            sub, sub_color = "低电量 · 请及时充电", BAT_LOW
+            sub, sub_color = _t("popup.low"), BAT_LOW
         elif charging:
-            sub, sub_color = "充电中", BAT_GOOD
+            sub, sub_color = _t("popup.charging"), BAT_GOOD
         elif full:
-            sub, sub_color = "已充满", BAT_GOOD
+            sub, sub_color = _t("popup.full"), BAT_GOOD
         else:
-            sub, sub_color = "DUALSHOCK 4", TEXT_SUB
+            sub, sub_color = _t("popup.dualshock"), TEXT_SUB
         c.create_text(131, 68, text=sub, anchor="w",
                       font=("Segoe UI", 9), fill=sub_color)
 
@@ -1368,9 +1506,9 @@ class BatteryOverlay:
             accent = BAT_GOOD
 
         # 2) 文字按缩放后的字号排布，避免被窗口边缘裁切
-        label = ("未连接" if not connected else
-                 "已充满" if full else
-                 "充电中" if charging else "DS4")
+        label = (_t("bar.disconnected") if not connected else
+                 _t("bar.full") if full else
+                 _t("bar.charging") if charging else _t("bar.ds4"))
         f_label = _bar_font(max(6, int(round(9 * sy))), "bold")
         f_pct = _bar_font(max(8, int(round(14 * sy))), "bold")
         lh = f_label.metrics("linespace")
@@ -1540,14 +1678,16 @@ class BatteryOverlay:
 
     def show_disconnect(self):
         """弹出断开提示。"""
-        self.draw_message("手柄已断开", "DS4")
+        self.draw_message(_t("popup.disconnected_title"),
+                          _t("popup.disconnected_sub"))
         log("弹出断开提示窗")
         self._present(HOLD_DISCONNECT_SECONDS)
 
     def show_overcharge(self, pct):
         """防过充提醒：插着线且电量已达阈值（软件无法断电，只能提醒拔线）。"""
-        self.draw_message("请拔掉充电线", "电量 %s%% · 防过充（已达 %d%%）"
-                          % (pct if pct is not None else "—", OVERCHARGE_PCT))
+        self.draw_message(_t("popup.overcharge_title"),
+                          _t("popup.overcharge_sub",
+                             pct if pct is not None else "—", OVERCHARGE_PCT))
         log("防过充提醒: 电量 %s%% 已达阈值 %d%%，提示拔线（软件无法切断充电）"
             % (pct, OVERCHARGE_PCT))
         self._present(HOLD_LOW_SECONDS)
@@ -1581,7 +1721,7 @@ class BatteryOverlay:
 
     def show_power(self, plugged):
         """蓝牙连接时接入/拔出电源提示（约 1.5 秒）。"""
-        title = "接入电源" if plugged else "拔出电源"
+        title = _t("popup.power_on") if plugged else _t("popup.power_off")
         self.draw_message(title, "DS4")
         log(f"弹出{title}提示窗")
         self._present(HOLD_POWER_SECONDS)
@@ -1919,8 +2059,35 @@ class BatteryOverlay:
         finally:
             self.root.after(POLL_MS, self.poll_loop)
 
+    def _check_lang_change(self):
+        """面板切换语言后即时热重载（面板会重写 _lang.signal 作通知）。"""
+        global _LANG, _LANG_SIG
+        sig = _lang_signal()
+        if not sig or sig == _LANG_SIG:
+            return
+        _LANG_SIG = sig
+        new = _load_lang()
+        if new == _LANG:
+            return
+        _LANG = new
+        log("语言已切换为 %s -> 立即重绘弹窗与顶部横条" % new)
+        try:
+            self.bar_last_key = None          # 让横条按新语言重绘
+            if self.bar_visible:
+                self.update_bar(*(self.bar_last_data
+                                  or (None, False, False, True)))
+                self.bar_win.update_idletasks()
+            # 弹窗若正在显示，用同一份数据换成新语言重画一次；
+            # 稍作延迟是为了避开正在进行的淡入/淡出动画
+            if self.state == "shown":
+                self.root.after(80, lambda: self.draw_battery(
+                    self.last_pct, self.last_charging, self.last_full))
+        except Exception:
+            pass
+
     def _poll_tick(self):
         self._last_tick = time.time()   # 心跳：看门狗据此判断主循环是否假死
+        self._check_lang_change()       # 面板切换语言后即时热重载
         # 先处理队列消息（主线程，tkinter 线程安全；单轮限次防极端积压）
         try:
             drained = 0
