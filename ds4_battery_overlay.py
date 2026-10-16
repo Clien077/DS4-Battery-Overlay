@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 DS4 电量提示悬浮窗
 ==================
@@ -126,7 +126,7 @@ MAGIC = "#010101"                      # 透明色键（不参与绘制，用于
 # ---- 版本号：全项目唯一来源 ----
 # 发布脚本、面板、管理程序都从这里/各自同名常量读取，避免各处版本号不一致。
 # 升级版本时只改这一处（以及 ds4_manager.py / ds4_battery_overlay_panel.py 的同名常量）。
-__version__ = "1.3"
+__version__ = "1.3.1"
 
 
 # ---- 手柄图标（base64 内嵌，避免依赖外部文件；打包后同样可用）----
@@ -1653,6 +1653,10 @@ class BatteryOverlay:
             else:
                 self.draw_bar(None, connected=True)   # 中性占位 --%，不误报"未连接"
             self.bar_win.deiconify()
+            # 每次显示都必须重打工具窗口样式：deiconify 映射窗口后扩展样式会
+            # 丢失（实测 exstyle 从 0x88 掉回 0x08），横条随即出现在任务栏 ——
+            # 这正是"切换连接状态后图标出现在任务栏"的根因之一。
+            _make_tool_window(self.bar_win)
             self.bar_win.attributes("-topmost", True)
             self.bar_win.lift()
             self.bar_win.update_idletasks()   # 立刻刷新，不等下一个事件循环
@@ -1885,7 +1889,9 @@ class BatteryOverlay:
                         log("PS 双击 -> 弹出电量")
                         self.last_ps_time = None
                         self.ps_cooldown_until = now + 1.5
-                        bi, _ = offs
+                        # bi 已在函数开头按报告 ID 解析好（修复：此处曾残留
+                        # `bi, _ = offs` 引用已删除的变量，导致每次双击都抛
+                        # NameError、电量窗弹不出来）
                         if len(data) > bi:
                             if data[0] == 0x11:
                                 maybe_dump_bt_report(data)
